@@ -40,3 +40,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# 本地数据（SQLite + 音频），用应用内“导出”备份
+/data

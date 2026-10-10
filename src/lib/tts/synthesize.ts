@@ -1,15 +1,19 @@
 import "server-only";
 import { getPersona, getTtsModel, sanitizeTags } from "@/lib/catalog";
 import { createSpeech } from "@/lib/zenmux";
+import { pcmToMp3 } from "@/lib/audio/mp3";
 
-export async function synthesize(opts: {
+export interface SynthesizeOptions {
   text: string;
   modelId: string;
   voice?: string;
   personaId: string;
   useStyle?: boolean;
   signal?: AbortSignal;
-}): Promise<{ audio: ArrayBuffer; mime: string }> {
+}
+
+/** 调用 TTS 并统一输出 MP3 */
+export async function synthesize(opts: SynthesizeOptions): Promise<{ audio: Buffer; mime: string; voice: string }> {
   const model = getTtsModel(opts.modelId);
   const voice = model.voices.some((v) => v.id === opts.voice) ? opts.voice! : model.defaultVoice;
   let input = sanitizeTags(opts.text, model);
@@ -19,5 +23,7 @@ export async function synthesize(opts: {
     input = `Read the following in a ${getPersona(opts.personaId).voiceStyle} tone:\n${input}`;
   }
 
-  return createSpeech({ model: model.id, input, voice, signal: opts.signal });
+  const r = await createSpeech({ model: model.id, input, voice, signal: opts.signal });
+  if (r.kind === "encoded") return { audio: r.data, mime: r.mime, voice };
+  return { audio: pcmToMp3(r.pcm, r.sampleRate, r.channels), mime: "audio/mpeg", voice };
 }

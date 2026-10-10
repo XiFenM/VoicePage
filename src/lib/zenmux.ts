@@ -94,18 +94,22 @@ export async function chatCompletion(opts: {
   return content;
 }
 
+export type SpeechResult =
+  | { kind: "pcm"; pcm: Buffer; sampleRate: number; channels: number }
+  | { kind: "encoded"; data: Buffer; mime: string };
+
 /**
  * POST /audio/speech
  * 非流式时返回 JSON：{ audio: base64, mime_type: "audio/L16;rate=24000", usage }。
- * 默认 response_format=pcm（16bit LE / 单声道 / 24kHz 裸 PCM），这里封装成 WAV 以便浏览器直接播放。
+ * 默认 response_format=pcm（16bit LE / 单声道 / 24kHz 裸 PCM）。
+ * 实测三家模型的 mime：audio/l16; rate=24000（Gemini）、audio/pcm;rate=24000（Qwen）、audio/pcm（Grok）
  */
 export async function createSpeech(opts: {
   model: string;
   input: string;
   voice?: string;
-  speed?: number;
   signal?: AbortSignal;
-}): Promise<{ audio: ArrayBuffer; mime: string }> {
+}): Promise<SpeechResult> {
   const res = await fetch(`${config.zenmuxBaseUrl}/audio/speech`, {
     method: "POST",
     headers: headers(),
@@ -114,7 +118,6 @@ export async function createSpeech(opts: {
       input: opts.input,
       voice: opts.voice,
       response_format: "pcm",
-      ...(opts.speed ? { speed: opts.speed } : {}),
     }),
     signal: opts.signal,
   });
@@ -126,11 +129,14 @@ export async function createSpeech(opts: {
 
   // 已是带容器的格式（某些供应商可能返回 wav/mp3），直接透传
   if (!mime.startsWith("audio/l16") && !mime.startsWith("audio/pcm")) {
-    return { audio: toArrayBuffer(bytes), mime: mime.split(";")[0] };
+    return { kind: "encoded", data: bytes, mime: mime.split(";")[0] };
   }
-  const rate = Number(mime.match(/rate=(\d+)/)?.[1] ?? 24000);
-  const channels = Number(mime.match(/channels=(\d+)/)?.[1] ?? 1);
-  return { audio: pcmToWav(bytes, rate, channels), mime: "audio/wav" };
+  return {
+    kind: "pcm",
+    pcm: bytes,
+    sampleRate: Number(mime.match(/rate=(\d+)/)?.[1] ?? 24000),
+    channels: Number(mime.match(/channels=(\d+)/)?.[1] ?? 1),
+  };
 }
 
 /** GET /models —— 列出可用模型（用于核对 TTS 模型） */
@@ -140,27 +146,4 @@ export async function listModels(): Promise<
   const res = await fetch(`${config.zenmuxBaseUrl}/models`, { headers: headers() });
   await ensureOk(res, "获取模型列表");
   return ((await res.json()) as { data: [] }).data;
-}
-
-function toArrayBuffer(buf: Buffer): ArrayBuffer {
-  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
-}
-
-function pcmToWav(pcm: Buffer, sampleRate: number, channels = 1, bits = 16): ArrayBuffer {
-  const header = Buffer.alloc(44);
-  const byteRate = (sampleRate * channels * bits) / 8;
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcm.length, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE((channels * bits) / 8, 32);
-  header.writeUInt16LE(bits, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(pcm.length, 40);
-  return toArrayBuffer(Buffer.concat([header, pcm]));
 }

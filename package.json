@@ -10,6 +10,8 @@
     "zenmux:models": "node --env-file=.env.local --experimental-strip-types scripts/zenmux-models.mts"
   },
   "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
+    "fflate": "^0.8.3",
     "next": "16.4.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
@@ -20,7 +22,7 @@
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",
-    "@types/node": "^20",
+    "@types/node": "^24.19.1",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
