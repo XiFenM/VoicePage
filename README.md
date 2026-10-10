@@ -64,11 +64,19 @@ pnpm dev                       # http://localhost:3000
 | 语音合成 | `POST /audio/speech` | 返回 JSON `{ audio: base64, mime_type: "audio/L16;rate=24000" }`，服务端把裸 PCM 封装成 WAV |
 | 核对模型 | `GET /models` | `pnpm zenmux:models` 列出可输出音频的模型 |
 
-TTS 模型在 `src/lib/catalog.ts` 的 `TTS_MODELS` 中配置，目前只有 ZenMux 文档里写到的 `google/gemini-3.1-flash-tts-preview`：
+TTS 模型在 `src/lib/catalog.ts` 的 `TTS_MODELS` 中配置。ZenMux 文档只写了 Gemini，另外两个模型的用法来自厂商官方文档，并通过 ZenMux 实测验证（合成后再用 `qwen/qwen3-asr-flash` 转写回来比对）：
 
-- **音色**：Gemini 的 30 个预置音色（Kore、Puck、Sulafat 等）
-- **语气标签**：Gemini TTS 的尖括号行内标签，如 `<short pause>`、`<sigh>`、`<chuckle>`（即使正文是中文也用英文标签）。这里只选了适合讲解场景的一部分
-- **角色语气**：`/audio/speech` 没有单独的风格参数，所以用一句英文前缀写进输入，如 `Read the following in a warm, patient teacher tone:`
+| 模型 | 音色 | 行内标签 | 角色语气 | 实测速度* |
+|---|---|---|---|---|
+| `google/gemini-3.1-flash-tts-preview` | 30 个预置音色 | `<short pause>` `<sigh>` 等尖括号写法，只表示某一时刻的声音或停顿 | 写一句英文风格前缀到输入里 | 慢（约 7~18s） |
+| `qwen/qwen-audio-3.0-tts-plus` | `longanlingxin`、`longanlufeng` | `[sighing]` 等一次性标签，加 `[serious]` 等语气切换标签（作用于后续所有文字） | 不支持（`instructions` 实测无效，前缀会被丢掉） | 中（约 4~14s） |
+| `x-ai/grok-voice-tts-1.0` | `ara` `eve` `leo` `rex` `sal` `una` | `[pause]` `[laugh]` 等方括号写法，不认识的标签会被静默忽略 | 不支持（前缀会被念出来） | 快（约 2~4s） |
+
+\* 一段 100~200 字中文的合成时间。另外：
+
+- 三个模型都返回 24kHz 单声道 PCM，服务端统一封装成 WAV。
+- 标签写法用错会出问题：Gemini 遇到 `[sigh]` 会发出“啊”的声音。所以合成前会用 `sanitizeTags` 去掉当前模型不认识的标签（比如切换模型后旧口述稿里的标签）。
+- `speed` 参数：Qwen 和 Grok 实测生效（1.5 倍时音频时长约缩短 1/3），Gemini 不生效。目前没有用它，倍速可以交给浏览器播放器的 `playbackRate` 处理。
 
 错误按 ZenMux 的 `{ error: { type, message } }` 格式解析，附带中文提示和 `X-ZenMux-RequestId`。
 

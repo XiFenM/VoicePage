@@ -79,7 +79,8 @@ export async function chatCompletion(opts: {
     body: JSON.stringify({
       model: opts.model,
       messages: opts.messages,
-      temperature: opts.temperature ?? 0.7,
+      // 部分新模型（如 claude-sonnet-5.5）已不接受 temperature，未指定时不传
+      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
       ...(opts.schema
         ? { response_format: { type: "json_schema", json_schema: { ...opts.schema, strict: true } } }
         : {}),

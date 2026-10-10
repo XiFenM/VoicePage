@@ -74,14 +74,13 @@ export async function addTags(
   const raw = await chatCompletion({
     model: config.scriptModel,
     schema: SEGMENTS_JSON_SCHEMA,
-    temperature: 0.5,
     signal,
     messages: [
       { role: "system", content: tagSystemPrompt(model, getPersona(personaId)) },
       { role: "user", content: tagUserPrompt(segments) },
     ],
   });
-  const allowed = new Set(model.tags.map((t) => formatTag(model.tagSyntax, t)));
+  const allowed = new Set(model.tags.map((t) => formatTag(model.tagSyntax, t.name)));
   const got = new Map(parseSegments(raw).map((s) => [s.id, s.speech]));
   return segments.map((s) => {
     let tagged = got.get(s.id) ?? s.speech;

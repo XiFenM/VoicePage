@@ -1,5 +1,5 @@
 import "server-only";
-import { getPersona, getTtsModel, stripTags } from "@/lib/catalog";
+import { getPersona, getTtsModel, sanitizeTags } from "@/lib/catalog";
 import { createSpeech } from "@/lib/zenmux";
 
 export async function synthesize(opts: {
@@ -12,7 +12,7 @@ export async function synthesize(opts: {
 }): Promise<{ audio: ArrayBuffer; mime: string }> {
   const model = getTtsModel(opts.modelId);
   const voice = model.voices.some((v) => v.id === opts.voice) ? opts.voice! : model.defaultVoice;
-  let input = model.tagSyntax === "none" ? stripTags(opts.text) : opts.text;
+  let input = sanitizeTags(opts.text, model);
 
   if (opts.useStyle !== false && model.styleMode === "prefix") {
     // Gemini 3.1 及更早 TTS：在文本前用一句简短的自然语言说明朗读风格
