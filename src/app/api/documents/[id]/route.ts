@@ -1,13 +1,15 @@
 import { z } from "zod";
 import { deleteDocument, getDocument, updateDocument } from "@/lib/store/documents";
 import { errorResponse } from "@/lib/http";
+import { abortBackgroundJobs, startBackgroundWorker } from "@/lib/generation/worker";
 
 const notFound = () => Response.json({ error: "记录不存在" }, { status: 404 });
 
 export async function GET(_req: Request, ctx: RouteContext<"/api/documents/[id]">) {
   try {
+    startBackgroundWorker();
     const doc = getDocument((await ctx.params).id);
-    return doc ? Response.json(doc) : notFound();
+    return doc ? Response.json(doc, { headers: { "Cache-Control": "no-store" } }) : notFound();
   } catch (e) {
     return errorResponse(e);
   }
@@ -25,7 +27,13 @@ const Patch = z.object({
 /** 改标题或 TTS 设置（改设置后旧音频会被标记为过期） */
 export async function PATCH(request: Request, ctx: RouteContext<"/api/documents/[id]">) {
   try {
-    const doc = updateDocument((await ctx.params).id, Patch.parse(await request.json()));
+    const { id } = await ctx.params;
+    const patch = Patch.parse(await request.json());
+    const before = getDocument(id);
+    const doc = updateDocument(id, patch);
+    if (before && Object.entries(patch).some(([key, value]) => key !== "title" && before[key as keyof typeof before] !== value)) {
+      abortBackgroundJobs(id);
+    }
     return doc ? Response.json(doc) : notFound();
   } catch (e) {
     return errorResponse(e);
@@ -34,7 +42,10 @@ export async function PATCH(request: Request, ctx: RouteContext<"/api/documents/
 
 export async function DELETE(_req: Request, ctx: RouteContext<"/api/documents/[id]">) {
   try {
-    return deleteDocument((await ctx.params).id) ? Response.json({ ok: true }) : notFound();
+    const { id } = await ctx.params;
+    const deleted = deleteDocument(id);
+    abortBackgroundJobs(id);
+    return deleted ? Response.json({ ok: true }) : notFound();
   } catch (e) {
     return errorResponse(e);
   }

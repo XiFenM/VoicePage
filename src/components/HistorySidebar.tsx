@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 import { getTtsModel } from "@/lib/catalog";
 import type { DocSummary } from "@/lib/store/types";
 import { api } from "./api";
+import { backgroundPercent, backgroundStatusText, documentProgress, isBackgroundActive } from "./background-progress";
 
 export function HistorySidebar(props: {
   docs: DocSummary[];
@@ -41,14 +42,18 @@ export function HistorySidebar(props: {
   async function rename(d: DocSummary) {
     const title = prompt("重命名", d.title)?.trim();
     if (!title || title === d.title) return;
-    await api.update(d.id, { title });
-    props.onChanged();
+    try {
+      await api.update(d.id, { title });
+      props.onChanged();
+    } catch (e) { setMsg(`改名失败：${(e as Error).message}`); }
   }
 
   async function remove(d: DocSummary) {
     if (!confirm(`删除「${d.title}」？口述稿和音频都会被删除。`)) return;
-    await api.remove(d.id);
-    props.onDeleted(d.id);
+    try {
+      await api.remove(d.id);
+      props.onDeleted(d.id);
+    } catch (e) { setMsg(`删除失败：${(e as Error).message}`); }
   }
 
   return (
@@ -99,6 +104,7 @@ export function HistorySidebar(props: {
                 </button>
               </span>
             </div>
+            <HistoryProgress doc={d} />
           </div>
         ))}
       </div>
@@ -138,6 +144,24 @@ export function HistorySidebar(props: {
         {msg && <p className="text-xs break-all text-zinc-500">{msg}</p>}
       </div>
     </aside>
+  );
+}
+
+function HistoryProgress({ doc }: { doc: DocSummary }) {
+  const progress = documentProgress(doc);
+  const active = isBackgroundActive(progress);
+  const failed = progress.status === "failed";
+  const percent = backgroundPercent(progress);
+  return (
+    <div className={`mt-1.5 space-y-1 text-xs ${failed ? "text-red-600 dark:text-red-400" : active ? "text-blue-600 dark:text-blue-400" : "text-zinc-500"}`}>
+      <div className="flex items-center justify-between gap-1">
+        <span>{backgroundStatusText(progress)}</span>
+        {progress.scriptReady && progress.status !== "running" && <span>{progress.completedSegments}/{progress.totalSegments}</span>}
+      </div>
+      <div role="progressbar" aria-label={`${doc.title}生成进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} className="h-1 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700">
+        <div className={`h-full transition-[width] ${failed ? "bg-red-500" : "bg-blue-500"}`} style={{ width: `${percent}%` }} />
+      </div>
+    </div>
   );
 }
 

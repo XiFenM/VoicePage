@@ -7,7 +7,7 @@ import type { DocSettings } from "@/lib/store/types";
 export function SettingsBar(props: {
   value: DocSettings;
   onChange: (patch: Partial<DocSettings>) => void;
-  /** 打开已有记录时：标签只在生成口述稿时起作用，不能再改 */
+  /** 打开已有记录时保留创建时的标签开关；标签在每段合成前准备。 */
   tagsLocked?: boolean;
 }) {
   const v = props.value;
@@ -36,7 +36,7 @@ export function SettingsBar(props: {
       />
       <label
         className={`flex items-center gap-1 ${model.tagSyntax === "none" || props.tagsLocked ? "opacity-40" : ""}`}
-        title={props.tagsLocked ? "标签在生成口述稿时插入；切换模型后，不被新模型识别的标签会在合成时自动去掉" : undefined}
+        title={props.tagsLocked ? "语气标签按段添加；切换模型后自动稿会重新准备标签，手工修改的稿件会保留" : undefined}
       >
         <input
           type="checkbox"

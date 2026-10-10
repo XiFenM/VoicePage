@@ -44,10 +44,10 @@ function parseSegments(raw: string) {
 export { splitMarkdown };
 
 /** 步骤 2：分块 -> 口述稿（LLM） */
-export async function toSpoken(blocks: SourceBlock[], personaId: string, signal?: AbortSignal) {
+export async function toSpoken(blocks: SourceBlock[], personaId: string, signal?: AbortSignal, scriptModel = config.scriptModel) {
   const persona = getPersona(personaId);
   const raw = await chatCompletion({
-    model: config.scriptModel,
+    model: scriptModel,
     schema: SEGMENTS_JSON_SCHEMA,
     signal,
     messages: [
@@ -66,13 +66,14 @@ export async function addTags(
   ttsModelId: string,
   personaId: string,
   signal?: AbortSignal,
+  scriptModel = config.scriptModel,
 ): Promise<ScriptSegment[]> {
   const model = getTtsModel(ttsModelId);
   if (model.tagSyntax === "none" || model.tags.length === 0) {
     return segments.map((s) => ({ ...s, tagged: s.speech }));
   }
   const raw = await chatCompletion({
-    model: config.scriptModel,
+    model: scriptModel,
     schema: SEGMENTS_JSON_SCHEMA,
     signal,
     messages: [
@@ -95,16 +96,18 @@ export async function addTags(
 export async function runScriptPipeline(input: {
   text: string;
   personaId: string;
-  ttsModelId: string;
-  useTags: boolean;
   signal?: AbortSignal;
+  scriptModel?: string;
 }): Promise<ScriptResult> {
+  input.signal?.throwIfAborted();
   const blocks = splitMarkdown(input.text);
   if (blocks.length === 0) return { blocks, segments: [] };
-  const spoken = await toSpoken(blocks, input.personaId, input.signal);
-  const segments = input.useTags
-    ? await addTags(spoken, input.ttsModelId, input.personaId, input.signal)
-    : spoken.map((s) => ({ ...s, tagged: s.speech }));
+  const model = input.scriptModel ?? config.scriptModel;
+  const spoken = await toSpoken(blocks, input.personaId, input.signal, model);
+  input.signal?.throwIfAborted();
+
+  // 整篇口述稿先保存、展示；后台执行器再逐段准备标签与语音。
+  const segments = spoken.map((s) => ({ ...s, tagged: s.speech }));
   return { blocks, segments };
 }
 

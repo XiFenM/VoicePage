@@ -2,6 +2,7 @@ import { z } from "zod";
 import { stripTags } from "@/lib/catalog";
 import { updateSegmentText } from "@/lib/store/documents";
 import { errorResponse } from "@/lib/http";
+import { abortBackgroundJobs } from "@/lib/generation/worker";
 
 const Body = z.object({ tagged: z.string().max(5000) });
 
@@ -11,6 +12,7 @@ export async function PATCH(request: Request, ctx: RouteContext<"/api/documents/
     const { id, idx } = await ctx.params;
     const { tagged } = Body.parse(await request.json());
     const ok = updateSegmentText(id, Number(idx), tagged, stripTags(tagged));
+    if (ok) abortBackgroundJobs(id, [Number(idx)]);
     return ok ? Response.json({ ok: true }) : Response.json({ error: "段落不存在" }, { status: 404 });
   } catch (e) {
     return errorResponse(e);

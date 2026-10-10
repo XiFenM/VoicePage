@@ -1,6 +1,7 @@
 import "server-only";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { unzipSync, zipSync, type Zippable } from "fflate";
 import { AUDIO_DIR, db, tx } from "./db";
 
@@ -10,7 +11,7 @@ import { AUDIO_DIR, db, tx } from "./db";
 // 设计为与数据库结构解耦：导入时按 manifest 逐条写入，方便以后升级表结构。
 
 export const BACKUP_FORMAT = "readaloud-backup";
-export const BACKUP_VERSION = 1;
+export const BACKUP_VERSION = 3;
 
 interface BackupSegment {
   idx: number;
@@ -19,8 +20,11 @@ interface BackupSegment {
   markdown: string;
   speech: string;
   tagged: string;
+  tagStatus?: "pending" | "ready" | "manual";
+  tagModelId?: string | null;
   audio: string | null; // zip 内路径
   audioHash: string | null;
+  audioVersion?: string | null;
   audioModelId: string | null;
   audioVoice: string | null;
   updatedAt: number;
@@ -38,7 +42,22 @@ interface BackupDocument {
   scriptModel: string | null;
   createdAt: number;
   updatedAt: number;
+  scriptReady?: boolean;
+  jobs?: BackupJob[];
   segments: BackupSegment[];
+}
+
+interface BackupJob {
+  idx: number;
+  kind: "script" | "segment";
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  phase: "queued" | "spoken" | "tags" | "tts";
+  force: boolean;
+  createdAt: number;
+  updatedAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  error: string | null;
 }
 
 interface Manifest {
@@ -73,6 +92,14 @@ export function exportBackup(ids?: string[]): { zip: Uint8Array; count: number }
       scriptModel: (d.script_model as string) ?? null,
       createdAt: Number(d.created_at),
       updatedAt: Number(d.updated_at),
+      scriptReady: !!d.script_ready,
+      jobs: (db().prepare("SELECT * FROM jobs WHERE doc_id = ? ORDER BY idx").all(d.id) as Row[]).map((job) => ({
+        idx: Number(job.idx), kind: job.kind as BackupJob["kind"], status: job.status as BackupJob["status"],
+        phase: job.phase as BackupJob["phase"], force: !!job.force,
+        createdAt: Number(job.created_at), updatedAt: Number(job.updated_at),
+        startedAt: job.started_at === null ? null : Number(job.started_at),
+        finishedAt: job.finished_at === null ? null : Number(job.finished_at), error: job.error as string | null,
+      })),
       segments: segs.map((s) => {
         let audio: string | null = null;
         if (s.audio_file) {
@@ -90,8 +117,11 @@ export function exportBackup(ids?: string[]): { zip: Uint8Array; count: number }
           markdown: s.markdown as string,
           speech: s.speech as string,
           tagged: s.tagged as string,
+          tagStatus: s.tag_status as BackupSegment["tagStatus"],
+          tagModelId: (s.tag_model_id as string) ?? null,
           audio,
           audioHash: audio ? ((s.audio_hash as string) ?? null) : null,
+          audioVersion: audio ? ((s.audio_version as string) ?? null) : null,
           audioModelId: audio ? ((s.audio_model_id as string) ?? null) : null,
           audioVoice: audio ? ((s.audio_voice as string) ?? null) : null,
           updatedAt: Number(s.updated_at),
@@ -172,21 +202,44 @@ export function importBackup(zipBytes: Uint8Array, mode: ImportMode = "skip"): I
         db().prepare("DELETE FROM documents WHERE id = ?").run(doc.id);
         db()
           .prepare(
-            `INSERT INTO documents (id, title, source_text, persona_id, tts_model_id, voice, use_tags, use_style, script_model, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO documents (id, title, source_text, persona_id, tts_model_id, voice, use_tags, use_style, script_model, created_at, updated_at, script_ready)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(doc.id, doc.title, doc.sourceText, doc.personaId, doc.ttsModelId, doc.voice, +doc.useTags, +doc.useStyle, doc.scriptModel, doc.createdAt, doc.updatedAt);
+          .run(doc.id, doc.title, doc.sourceText, doc.personaId, doc.ttsModelId, doc.voice, +doc.useTags, +doc.useStyle, doc.scriptModel, doc.createdAt, doc.updatedAt, manifest.version < 3 || doc.scriptReady !== false ? 1 : 0);
         const ins = db().prepare(
-          `INSERT INTO segments (doc_id, idx, kind, lang, markdown, speech, tagged, audio_file, audio_hash, audio_bytes, audio_model_id, audio_voice, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO segments (doc_id, idx, kind, lang, markdown, speech, tagged, tag_status, tag_model_id, audio_file, audio_hash, audio_version, audio_bytes, audio_model_id, audio_voice, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         );
         for (const s of doc.segments) {
           const rel = audioRel.get(s.idx) ?? null;
+          const tagStatus = manifest.version < 2 ? "ready" : s.tagStatus;
+          if (tagStatus !== "pending" && tagStatus !== "ready" && tagStatus !== "manual") throw new BackupError("备份中的标签状态无效");
           ins.run(
             doc.id, s.idx, s.kind, s.lang, s.markdown, s.speech, s.tagged,
-            rel, rel ? s.audioHash : null, rel ? entries[s.audio!].length : null,
+            tagStatus, manifest.version < 2 ? doc.ttsModelId : s.tagModelId ?? null,
+            rel, rel ? s.audioHash : null, rel ? crypto.randomUUID() : null, rel ? entries[s.audio!].length : null,
             rel ? s.audioModelId : null, rel ? s.audioVoice : null, s.updatedAt,
           );
+        }
+        if (manifest.version >= 3) {
+          const jobs = doc.jobs ?? [];
+          const insertJob = db().prepare(`INSERT INTO jobs (doc_id, idx, kind, status, phase, force, created_at, updated_at, started_at, finished_at, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+          const now = Date.now();
+          for (const job of jobs) {
+            if (!Number.isInteger(job.idx) || job.idx < -1 || (job.idx === -1) !== (job.kind === "script") ||
+              !["queued", "spoken", "tags", "tts"].includes(job.phase) ||
+              !["queued", "running", "completed", "failed", "cancelled"].includes(job.status)) throw new BackupError("备份中的后台任务无效");
+            if (job.idx >= 0 && !doc.segments.some((s) => s.idx === job.idx)) throw new BackupError("备份中的后台任务缺少对应段落");
+            const hasOutput = job.idx === -1 ? doc.scriptReady !== false : audioRel.has(job.idx) || !doc.segments.find((s) => s.idx === job.idx)!.tagged.trim();
+            const completed = job.status === "completed" && hasOutput;
+            // 恢复时保留成果，但绝不自动恢复收费请求，也不携带旧 owner/租约。
+            insertJob.run(doc.id, job.idx, job.kind, completed ? "completed" : "cancelled", job.phase, +job.force,
+              job.createdAt, now, completed ? job.startedAt : null, completed ? job.finishedAt : now, completed ? job.error : null);
+          }
+          if (doc.scriptReady === false && !jobs.some((job) => job.idx === -1)) {
+            insertJob.run(doc.id, -1, "script", "cancelled", "queued", 0, now, now, null, now, null);
+          }
         }
       });
     } catch (e) {

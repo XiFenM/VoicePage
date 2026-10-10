@@ -4,23 +4,41 @@
 
 ## 处理流程
 
-```
-原始回复 (Markdown)
-   │ ① 分块（本地）           src/lib/script/segment.ts
-   ▼    text / code / table / diagram / math
-阅读块[]
-   │ ② 转口述稿（LLM）         src/lib/script/pipeline.ts · toSpoken
-   ▼    按“老师 / 朋友 / 播报”等角色讲解代码、表格、图表，不逐字念
-口述稿[]
-   │ ③ 加语气标签（LLM，可选） src/lib/script/pipeline.ts · addTags
-   ▼    只用所选 TTS 模型支持的标签，不改文字（会做校验）
-带标签口述稿[]
-   │ ④ 逐块 TTS（ZenMux）      src/lib/tts/synthesize.ts
-   ▼
-音频[]  →  前端按块顺序播放，并高亮当前阅读块
+```text
+提交原始回复 (Markdown)
+   ↓ 原文 + 持久任务一起写入 SQLite，立即返回 202
+页面可自由切换或关闭
+   │
+服务端后台队列（所有记录合计最多同时处理 2 个任务）
+   ├─ ① 本地分块 → ② LLM 生成口述稿 → 保存分段
+   ├─ 第 1 段：③ 添加标签 → ④ TTS → 保存音频 → 可以播放
+   ├─ 第 2 段：③ 添加标签 → ④ TTS → 保存音频
+   └─ 后续段依次入队；失败段不会挡住其余段落
+
+前端每 2 秒读取持久进度，按块播放并高亮原文。
 ```
 
-按块处理的好处：前面几块合成好就能开始播放；播放时可以精确高亮对应原文；单块失败可以单独重试；口述稿也可以手动修改后重新合成。
+### 真正的后台生成
+
+- 提交后立即保存原文和任务，口述稿阶段也不需要留在页面。可以切到其他记录听读、继续新建任务、刷新或关闭浏览器。
+- 后台执行器随 **常驻 Node 服务**启动，不依赖某次 HTTP 连接。运行应用的服务器必须在线；如果服务跑在自己的电脑上，关闭电脑或停止 `pnpm dev/start` 会暂停生成。
+- SQLite 保存排队、运行、完成、失败和停止状态。执行器每秒检查队列，使用默认 60 秒租约和心跳；进程异常退出后，重启服务会自动接续排队任务，过期租约会重新领取，无需浏览器访问。
+- 标签和音频逐段保存。重试复用已保存结果；音频保存与任务完成在同一事务中提交。若进程在上游请求已发出、结果尚未保存时退出，该请求恢复后可能需要重新调用，不能保证上游恰好计费一次。
+- “停止生成”会停止未完成工作，保留已有成果；失败不会无限自动重试，可以明确重试失败任务。重新打开旧记录或导入备份不会自动消耗模型额度，尚未生成的内容可点击“继续生成”。
+- 修改口述稿会暂停该段任务；修改声音设置会暂停该篇任务。旧异步结果通过租约、修订号和输入快照校验，不能覆盖手工修改。保存后可明确重新生成。
+
+### 状态与进度
+
+历史列表和阅读页显示排队、口述稿生成中、语音完成段数、失败、已停止及已完成。页面刷新后状态仍在；列表刷新不打断当前播放。剩余时间仅在已有该任务的段落耗时样本时以粗略区间展示，长时间超出样本会改为“暂无法准确估计”。
+
+接口：
+
+- `POST /api/documents`：保存原文并入队，立即返回 `202` 与包含 `generation` 的文档草稿。
+- `GET /api/documents` / `GET /api/documents/:id`：查询列表、文档和持久进度。
+- `POST /api/documents/:id/generation`：`{ action: "start" | "retry" | "cancel", indices?: number[], force?: boolean }`，继续、重试或停止全部/指定段落。
+- 旧单段 `tags` / `tts` 入口现在同样返回 `202` 入队状态，不能绕过全局并发限制直接调用模型。
+
+运行 `pnpm test` 可执行持久队列、租约、迁移与前端状态合并测试。`node scripts/check-background-generation.mjs` 会自建独立本地模拟环境，验证关闭连接后继续生成、全局并发、失败重试、取消和服务重启恢复，不调用真实模型。运行方式和可选参数见脚本开头。
 
 ## 数据存储与备份
 
@@ -28,11 +46,11 @@
 
 ```
 data/
-├── readaloud.db          # SQLite（Node 内置 node:sqlite）：原文、分块、口述稿、设置
+├── readaloud.db          # SQLite（Node 内置 node:sqlite）：原文、分块、口述稿、设置、后台任务
 └── audio/<记录id>/       # 每段一个 MP3（64kbps 单声道，约 0.47MB/分钟）
 ```
 
-- 新建后立即保存，每段音频合成完也立即落盘；中途关掉页面，已完成的部分不会丢，下次打开会自动补齐缺失的音频。
+- 新建后原文与任务立即保存，每段标签和音频也独立落盘；关闭页面后服务端继续生成，回来读取最新进度。
 - 手动修改的口述稿会自动保存。修改口述稿，或更改模型、音色、角色语气后，旧音频会标记为“已过期”，可以一键重新合成，新音频覆盖旧的。
 - 重新打开已有记录时直接播放已存的音频，不会重复调用 TTS。
 
@@ -41,7 +59,7 @@ data/
 左侧栏底部的“备份与迁移”：
 
 - **导出全部**：下载 `readaloud-backup-<时间>.zip`，内含 `manifest.json`（全部记录）和 `audio/` 下的所有 MP3。
-- **导入**：选择备份 zip。默认跳过已存在的记录，重复导入同一个备份是安全的；勾选“覆盖”则用备份中的版本替换。
+- **导入**：选择备份 zip。默认跳过已存在的记录，重复导入同一个备份是安全的；勾选“覆盖”则用备份中的版本替换。备份 v3 保留尚未完成的原文草稿与已生成成果，但导入后的未完成任务处于停止状态，需要手动继续；兼容 v1/v2 备份。
 
 迁移步骤：旧机器导出 → 新机器部署并配好 `.env.local` → 登录后导入。也可以直接把整个 `data/` 目录拷过去（需先停止服务）。
 
@@ -51,20 +69,22 @@ data/
 
 ```
 src/
+├── instrumentation.ts        # Node 启动时恢复后台队列
 ├── proxy.ts                  # 单用户鉴权（Next 16 中 middleware 已更名为 proxy）
 ├── app/
 │   ├── page.tsx              # 主页面
 │   ├── login/page.tsx        # 登录页
 │   └── api/
 │       ├── login|logout/     # 密码登录 / 退出
-│       ├── documents/        # 记录：新建（步骤 ①②③）、读取、改设置、删除
-│       │   └── [id]/segments/[idx]/tts  # 步骤 ④：合成某段音频并存为 MP3
+│       ├── documents/        # 记录：新建入队、读取持久进度、改设置、删除
+│       │   └── [id]/generation        # 启动、失败重试、停止任务
+│       │   └── [id]/segments/[idx]/   # 编辑口述稿及兼容单段入队接口
 │       │   └── [id]/audio/[idx]         # 读取已存音频
 │       └── backup/route.ts   # 导出 / 导入 zip
 ├── components/
 │   ├── Studio.tsx            # 总布局：历史栏 + 新建 / 阅读
 │   ├── HistorySidebar.tsx    # 历史列表、改名、删除、导出导入
-│   ├── Reader.tsx            # 阅读 + 播放 + 编辑口述稿 + 合成队列
+│   ├── Reader.tsx            # 阅读 + 播放 + 编辑口述稿 + 进度轮询
 │   └── SettingsBar.tsx       # 角色 / 模型 / 音色 / 标签设置
 └── lib/
     ├── catalog.ts            # 讲述角色、TTS 模型能力表（音色/标签/协议）
@@ -72,7 +92,8 @@ src/
     ├── auth.ts               # HMAC 签名 session
     ├── zenmux.ts             # ZenMux 客户端（chat / audio speech / models）
     ├── http.ts               # 错误响应
-    ├── store/                # SQLite、记录读写、备份导入导出
+    ├── store/                # SQLite、任务与租约、记录读写、备份
+    ├── generation/worker.ts  # 服务端调度、标签与 TTS 执行
     ├── audio/mp3.ts          # PCM -> MP3（lamejs）
     ├── script/               # 分块、prompt、流水线
     └── tts/                  # TTS 调度
@@ -86,6 +107,26 @@ cp .env.example .env.local     # 填入 ZENMUX_API_KEY、APP_PASSWORD、SESSION_
 pnpm zenmux:models             # 可选：确认账户下可用的 TTS 模型
 pnpm dev                       # http://localhost:3000
 ```
+
+## Cloudflare 部署评估（2026-10-10）
+
+当前代码运行在拥有持久磁盘的 Node 服务上，尚未适配 Cloudflare。可以迁移到 Cloudflare，但不能把现有仓库原样部署为 Pages 静态站点：[Pages 的 Next.js 指南](https://developers.cloudflare.com/pages/framework-guides/nextjs/)将静态导出放在 Pages，完整应用指向 Workers。
+
+建议的目标结构是 **Workers（页面和 API）+ D1（文档和分段）+ 私有 R2（音频）+ Cloudflare Access（仅本人访问）**。迁移时至少需要：
+
+- 将 `node:sqlite` 改为 D1 或其他持久数据库接口；将本地音频读写和备份改为 R2。Workers 的 [`node:fs` 临时文件跨请求不持久](https://developers.cloudflare.com/workers/runtime-apis/nodejs/fs/)，不能沿用当前 `data/` 目录。
+- 验证 Next.js 16.4 的框架适配。官方当前推荐 [vinext on Workers](https://developers.cloudflare.com/workers/framework-guides/web-apps/nextjs/)，但仍处于 beta；本仓库的 `cacheComponents`、`partialPrefetching` 需要单独检查。[OpenNext](https://opennext.js.org/cloudflare)也是候选适配器，不能仅凭支持 Next.js 16 就认为所有配置与运行时已兼容。
+- 后台执行器当前依赖常驻 Node 进程，不能把内存定时器直接搬到请求结束后可能休眠的运行时。迁移时需要托管持久队列/工作流接管执行，并保留状态、重试与幂等写入。
+- 在 Workers 运行时测试 MP3 编码的 CPU/内存开销和备份大小；本地 Node 构建成功不等于 Workers 部署验证通过。
+
+只供本人访问时，保留应用现有密码登录，并按以下方式保护发布入口：
+
+- 在该 Worker 的 Access 页选择 **All traffic**，保护生产和预览。Worker 级策略会覆盖其自定义域名、routes、`workers.dev` 与预览入口；如果只使用域名级策略，则需要单独保护或关闭其他入口。见 [Worker 级 Access](https://developers.cloudflare.com/workers/configuration/cloudflare-access/#protect-one-worker)。
+- Allow 规则只填写自己的完整邮箱，通过[邮箱一次性验证码](https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/one-time-pin/)或自己的身份提供商登录；不要放行整个邮箱域名或所有用户。
+- 保护整个应用，包括模型调用 API、音频和备份。若拆分为 Pages 前端，也需保护生产 `pages.dev`、自定义域及预览，避免旁路。
+- ZenMux 密钥和会话密钥放服务端 Secrets；R2 保持私有，音频通过鉴权 API 返回。
+
+上述云端迁移与 Access 配置尚未执行。
 
 ## ZenMux 接入说明
 

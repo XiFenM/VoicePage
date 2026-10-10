@@ -1,41 +1,20 @@
-import { synthesize } from "@/lib/tts/synthesize";
-import { audioHash, getDocument, getSegmentForTts, saveSegmentAudio } from "@/lib/store/documents";
+import { getDocument } from "@/lib/store/documents";
+import { enqueueDocumentJobs } from "@/lib/store/jobs";
+import { startBackgroundWorker } from "@/lib/generation/worker";
 import { errorResponse } from "@/lib/http";
 
-/**
- * 按文档当前设置为某段合成音频，转 MP3 存盘（覆盖旧音频），返回更新后的段信息。
- * 已有且未过期的音频直接返回，不重复调用 TTS（除非 ?force=1）。
- */
-export async function POST(request: Request, ctx: RouteContext<"/api/documents/[id]/segments/[idx]/tts">) {
+/** 兼容旧单段入口，返回已入队状态；音频由后台生成，通过文档 GET 查询。 */
+export async function POST(request: Request, ctx: { params: Promise<{ id: string; idx: string }> }) {
   try {
-    const { id, idx: idxStr } = await ctx.params;
-    const idx = Number(idxStr);
-    const force = new URL(request.url).searchParams.get("force") === "1";
-
-    const existing = getDocument(id)?.segments[idx];
-    if (!existing) return Response.json({ error: "段落不存在" }, { status: 404 });
-    if (!force && existing.audioUrl && existing.audioFresh) return Response.json(existing);
-
-    const seg = getSegmentForTts(id, idx)!;
-    if (!seg.tagged.trim()) return Response.json({ error: "口述稿为空" }, { status: 400 });
-    const { settings } = seg;
-
-    const { audio, voice, mime } = await synthesize({
-      text: seg.tagged,
-      modelId: settings.ttsModelId,
-      voice: settings.voice,
-      personaId: settings.personaId,
-      useStyle: settings.useStyle,
-      signal: request.signal,
-    });
-    saveSegmentAudio(id, idx, audio, {
-      hash: audioHash({ text: seg.tagged, modelId: settings.ttsModelId, voice: settings.voice, useStyle: settings.useStyle, personaId: settings.personaId }),
-      modelId: settings.ttsModelId,
-      voice,
-      ext: mime === "audio/mpeg" ? "mp3" : mime === "audio/wav" ? "wav" : "bin",
-    });
-    return Response.json(getDocument(id)!.segments[idx]);
-  } catch (e) {
-    return errorResponse(e);
+    const { id, idx: rawIdx } = await ctx.params;
+    const idx = Number(rawIdx);
+    if (!Number.isInteger(idx) || !getDocument(id)?.segments.some((s) => s.idx === idx)) {
+      return Response.json({ error: "段落不存在" }, { status: 404 });
+    }
+    const doc = enqueueDocumentJobs(id, { indices: [idx], force: new URL(request.url).searchParams.get("force") === "1" });
+    startBackgroundWorker();
+    return Response.json(doc!.segments.find((s) => s.idx === idx), { status: 202 });
+  } catch (error) {
+    return errorResponse(error);
   }
 }
