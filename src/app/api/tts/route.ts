@@ -7,6 +7,7 @@ const Body = z.object({
   modelId: z.string(),
   voice: z.string().optional(),
   personaId: z.string().default("teacher"),
+  useStyle: z.boolean().default(true),
 });
 
 export async function POST(request: Request) {

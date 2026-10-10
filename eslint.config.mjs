@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // 项目级 agent skills（含 clone 下来的 ZenMux 文档仓库）
+    ".agents/**",
   ]),
 ]);
 

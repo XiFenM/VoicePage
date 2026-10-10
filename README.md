@@ -39,7 +39,7 @@ src/
     ├── catalog.ts            # 讲述角色、TTS 模型能力表（音色/标签/协议）
     ├── config.ts             # 环境变量
     ├── auth.ts               # HMAC 签名 session
-    ├── zenmux.ts             # ZenMux 客户端（OpenAI 协议 + Vertex AI 协议）
+    ├── zenmux.ts             # ZenMux 客户端（chat / audio speech / models）
     ├── http.ts               # 错误响应
     ├── script/               # 分块、prompt、流水线
     └── tts/                  # TTS 调度
@@ -50,23 +50,48 @@ src/
 ```bash
 pnpm install
 cp .env.example .env.local     # 填入 ZENMUX_API_KEY、APP_PASSWORD、SESSION_SECRET
+pnpm zenmux:models             # 可选：确认账户下可用的 TTS 模型
 pnpm dev                       # http://localhost:3000
 ```
 
 ## ZenMux 接入说明
 
-- **口述稿 LLM**：走 OpenAI 兼容的 `POST {ZENMUX_BASE_URL}/chat/completions`，模型由 `SCRIPT_MODEL` 指定。
-- **TTS**：在 `src/lib/catalog.ts` 的 `TTS_MODELS` 中配置，每个模型声明：
-  - `protocol`：`gemini`（Vertex AI 协议 `:generateContent`，返回 PCM，服务端封装为 WAV）或 `openai-speech`（`/audio/speech`）
-  - `voices` / `defaultVoice`
-  - `tagStyle` + `tags`：是否支持内联语气标签、支持哪些标签（会写入步骤 ③ 的 prompt）
-  - `supportsStyleInstruction`：是否支持自然语言朗读风格指令（角色的 `voiceStyle`）
+所有接口都依据 ZenMux 官方文档（见下方“项目级 Skills”）编写，统一走 OpenAI 兼容入口 `https://zenmux.ai/api/v1`：
 
-> ⚠️ 模型 slug 和接口路径是按 ZenMux 文档的约定写的，请到 ZenMux 控制台核对你账户可用的 TTS 模型名，不一致时修改 `catalog.ts` 或 `.env.local` 中的 `ZENMUX_*_BASE_URL` 即可。
+| 用途 | 接口 | 说明 |
+|---|---|---|
+| 口述稿 / 加标签 | `POST /chat/completions` | `response_format: json_schema` 结构化输出，模型由 `SCRIPT_MODEL` 指定 |
+| 语音合成 | `POST /audio/speech` | 返回 JSON `{ audio: base64, mime_type: "audio/L16;rate=24000" }`，服务端把裸 PCM 封装成 WAV |
+| 核对模型 | `GET /models` | `pnpm zenmux:models` 列出可输出音频的模型 |
+
+TTS 模型在 `src/lib/catalog.ts` 的 `TTS_MODELS` 中配置，目前只有 ZenMux 文档里写到的 `google/gemini-3.1-flash-tts-preview`：
+
+- **音色**：Gemini 的 30 个预置音色（Kore、Puck、Sulafat 等）
+- **语气标签**：Gemini TTS 的尖括号行内标签，如 `<short pause>`、`<sigh>`、`<chuckle>`（即使正文是中文也用英文标签）。这里只选了适合讲解场景的一部分
+- **角色语气**：`/audio/speech` 没有单独的风格参数，所以用一句英文前缀写进输入，如 `Read the following in a warm, patient teacher tone:`
+
+错误按 ZenMux 的 `{ error: { type, message } }` 格式解析，附带中文提示和 `X-ZenMux-RequestId`。
+
+## 项目级 Skills
+
+ZenMux 官方 skills（[ZenMux/skills](https://github.com/ZenMux/skills)）安装在 `.agents/skills/`，pi 等 agent 会自动发现：
+
+| Skill | 用途 |
+|---|---|
+| `zenmux-context` | 查阅 ZenMux 官方文档（会把 `ZenMux/zenmux-doc` clone 到 skill 目录下，已加入 `.agents/.gitignore`） |
+| `zenmux-setup` | 接入配置引导 |
+| `zenmux-usage` | 查询订阅、配额、余额、单次请求费用 |
+| `zenmux-feedback` | 向 ZenMux 提 issue |
+
+```bash
+npx skills update -p                                              # 更新 skills
+bash .agents/skills/zenmux-context/scripts/update-references.sh   # 拉取/更新文档
+```
 
 ## 后续可做
 
 - 历史记录持久化（SQLite），缓存已合成的音频
 - 句子级高亮（利用 TTS 时间戳或按句切分）
 - 播放倍速、键盘快捷键
-- 更多 TTS 模型（如支持 SSML / 情绪标签的国产模型）
+- ZenMux 上线新 TTS 模型（如 Gemini 3.8 TTS）后加入 `catalog.ts`
+- `/audio/speech` 的 `stream: true`，边合成边播放，减少等待

@@ -10,17 +10,13 @@ export const config = {
   get zenmuxApiKey() {
     return required("ZENMUX_API_KEY");
   },
-  /** OpenAI 兼容协议入口（chat / audio speech） */
+  /** ZenMux OpenAI 兼容协议入口：chat/completions、audio/speech、models 都在这里 */
   get zenmuxBaseUrl() {
     return (process.env.ZENMUX_BASE_URL ?? "https://zenmux.ai/api/v1").replace(/\/$/, "");
   },
-  /** Vertex AI 协议入口（Gemini TTS 使用） */
-  get zenmuxVertexBaseUrl() {
-    return (process.env.ZENMUX_VERTEX_BASE_URL ?? "https://zenmux.ai/api/vertex-ai").replace(/\/$/, "");
-  },
-  /** 转口述稿用的 LLM */
+  /** 转口述稿用的 LLM（需支持 response_format=json_schema） */
   get scriptModel() {
-    return process.env.SCRIPT_MODEL ?? "openai/gpt-4.1-mini";
+    return process.env.SCRIPT_MODEL ?? "google/gemini-2.5-flash";
   },
   get appPassword() {
     return required("APP_PASSWORD");

@@ -1,4 +1,4 @@
-import type { Persona, TtsModel } from "@/lib/catalog";
+import { formatTag, type Persona, type TtsModel } from "@/lib/catalog";
 import type { SourceBlock } from "./segment";
 
 export function spokenSystemPrompt(persona: Persona): string {
@@ -19,8 +19,8 @@ export function spokenSystemPrompt(persona: Persona): string {
 8. 只输出纯文本口述内容，不要输出任何 Markdown、括号注释、表情符号或语气标签。
 9. 块与块之间可以有自然的衔接语，但每段口述稿必须只对应它自己的块。
 
-## 输出格式
-只输出 JSON：{"segments":[{"id":0,"speech":"..."},{"id":1,"speech":"..."}]}，每个输入块恰好一项，id 与输入一致。`;
+## 输出
+按给定 JSON Schema 输出，每个输入块恰好一项，id 与输入一致。`;
 }
 
 export function spokenUserPrompt(blocks: SourceBlock[]): string {
@@ -30,20 +30,23 @@ export function spokenUserPrompt(blocks: SourceBlock[]): string {
 }
 
 export function tagSystemPrompt(model: TtsModel, persona: Persona): string {
+  const tags = model.tags.map((t) => formatTag(model.tagSyntax, t));
+  const ex = formatTag(model.tagSyntax, "short pause");
   return `你是语音导演。下面是一组将交给语音合成模型「${model.label}」朗读的口述稿，讲述者的角色是：${persona.label}。
-请在**不改动任何文字**的前提下，为它们插入适量的语气/停顿标签，让朗读更自然、更有表现力。
+请在**不改动任何文字**的前提下，插入少量行内标签，让朗读更自然、更像真人在讲解。
 
-## 可用标签（只能使用这些，原样书写）
-${model.tags.join("  ")}
+## 可用标签（只能使用这些，原样书写，即使正文是中文也保持英文）
+${tags.join("  ")}
 
 ## 规则
-1. 不得增删或改写原文字，只能在合适的位置插入标签。
-2. 克制使用：平均每 2~3 句话最多一个标签，不要每句都加。
-3. 停顿标签适合放在转折处、引导用户看屏幕上的代码或图表之前。
-4. 情绪标签必须与内容和角色相符。
+1. 不得增删或改写原文字（包括标点），只能在合适的位置插入标签。
+2. 行内标签只表示"某一时刻"的非语言声音或停顿，例如 "注意看这里 ${ex} 这一行是关键"。持续的情绪/语速不要用标签表达。
+3. 克制使用：平均每 2~3 句话最多一个标签，大多数句子不需要标签。
+4. 停顿标签适合放在转折处、或引导用户看屏幕上的代码/表格/图之前。
+5. 情绪类标签（笑、叹气等）必须与内容和角色相符，宁缺毋滥。
 
-## 输出格式
-只输出 JSON：{"segments":[{"id":0,"speech":"..."}]}，id 与输入一致，每个输入项恰好一项。`;
+## 输出
+按给定 JSON Schema 输出，id 与输入一致，每个输入项恰好一项。`;
 }
 
 export function tagUserPrompt(segments: { id: number; speech: string }[]): string {

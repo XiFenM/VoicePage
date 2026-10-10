@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "zenmux:models": "node --env-file=.env.local --experimental-strip-types scripts/zenmux-models.mts"
   },
   "dependencies": {
     "next": "16.4.0",

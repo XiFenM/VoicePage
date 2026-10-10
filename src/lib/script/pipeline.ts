@@ -2,7 +2,7 @@ import "server-only";
 import { z } from "zod";
 import { config } from "@/lib/config";
 import { chatCompletion } from "@/lib/zenmux";
-import { getPersona, getTtsModel, stripTags } from "@/lib/catalog";
+import { TAG_PATTERN, formatTag, getPersona, getTtsModel, stripTags } from "@/lib/catalog";
 import { splitMarkdown, type SourceBlock } from "./segment";
 import type { ScriptResult, ScriptSegment } from "./types";
 
@@ -12,6 +12,27 @@ import { spokenSystemPrompt, spokenUserPrompt, tagSystemPrompt, tagUserPrompt } 
 const SegmentsSchema = z.object({
   segments: z.array(z.object({ id: z.coerce.number(), speech: z.string() })),
 });
+
+/** 结构化输出：ZenMux chat/completions 的 response_format=json_schema */
+const SEGMENTS_JSON_SCHEMA = {
+  name: "segments",
+  schema: {
+    type: "object",
+    properties: {
+      segments: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { id: { type: "integer" }, speech: { type: "string" } },
+          required: ["id", "speech"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["segments"],
+    additionalProperties: false,
+  },
+};
 
 function parseSegments(raw: string) {
   // 兼容模型把 JSON 包在 ```json 里的情况
@@ -27,7 +48,7 @@ export async function toSpoken(blocks: SourceBlock[], personaId: string, signal?
   const persona = getPersona(personaId);
   const raw = await chatCompletion({
     model: config.scriptModel,
-    json: true,
+    schema: SEGMENTS_JSON_SCHEMA,
     signal,
     messages: [
       { role: "system", content: spokenSystemPrompt(persona) },
@@ -47,12 +68,12 @@ export async function addTags(
   signal?: AbortSignal,
 ): Promise<ScriptSegment[]> {
   const model = getTtsModel(ttsModelId);
-  if (model.tagStyle === "none" || model.tags.length === 0) {
+  if (model.tagSyntax === "none" || model.tags.length === 0) {
     return segments.map((s) => ({ ...s, tagged: s.speech }));
   }
   const raw = await chatCompletion({
     model: config.scriptModel,
-    json: true,
+    schema: SEGMENTS_JSON_SCHEMA,
     temperature: 0.5,
     signal,
     messages: [
@@ -60,15 +81,15 @@ export async function addTags(
       { role: "user", content: tagUserPrompt(segments) },
     ],
   });
-  const allowed = new Set(model.tags.map((t) => t.toLowerCase()));
+  const allowed = new Set(model.tags.map((t) => formatTag(model.tagSyntax, t)));
   const got = new Map(parseSegments(raw).map((s) => [s.id, s.speech]));
   return segments.map((s) => {
     let tagged = got.get(s.id) ?? s.speech;
     // 去掉模型自创的标签
-    tagged = tagged.replace(/\[[^\]\n]{1,30}\]/g, (m) => (allowed.has(m.toLowerCase()) ? m : ""));
+    tagged = tagged.replace(TAG_PATTERN, (m) => (allowed.has(m.toLowerCase()) ? m : ""));
     // 若 LLM 擅自改了文字，则放弃标签版本
     if (normalize(stripTags(tagged)) !== normalize(s.speech)) tagged = s.speech;
-    return { ...s, tagged };
+    return { ...s, tagged: tagged.replace(/[ \t]{2,}/g, " ").trim() };
   });
 }
 

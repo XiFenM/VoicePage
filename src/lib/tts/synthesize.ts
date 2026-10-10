@@ -1,29 +1,23 @@
 import "server-only";
 import { getPersona, getTtsModel, stripTags } from "@/lib/catalog";
-import { geminiSpeech, openaiSpeech } from "@/lib/zenmux";
+import { createSpeech } from "@/lib/zenmux";
 
 export async function synthesize(opts: {
   text: string;
   modelId: string;
   voice?: string;
   personaId: string;
+  useStyle?: boolean;
   signal?: AbortSignal;
 }): Promise<{ audio: ArrayBuffer; mime: string }> {
   const model = getTtsModel(opts.modelId);
   const voice = model.voices.some((v) => v.id === opts.voice) ? opts.voice! : model.defaultVoice;
-  const persona = getPersona(opts.personaId);
-  const text = model.tagStyle === "none" ? stripTags(opts.text) : opts.text;
+  let input = model.tagSyntax === "none" ? stripTags(opts.text) : opts.text;
 
-  if (model.protocol === "gemini") {
-    // Gemini TTS 通过自然语言前缀控制整体风格
-    const prompt = model.supportsStyleInstruction ? `${persona.voiceStyle}：\n${text}` : text;
-    return geminiSpeech({ model: model.id, text: prompt, voice, signal: opts.signal });
+  if (opts.useStyle !== false && model.styleMode === "prefix") {
+    // Gemini 3.1 及更早 TTS：在文本前用一句简短的自然语言说明朗读风格
+    input = `Read the following in a ${getPersona(opts.personaId).voiceStyle} tone:\n${input}`;
   }
-  return openaiSpeech({
-    model: model.id,
-    input: text,
-    voice,
-    instructions: model.supportsStyleInstruction ? persona.voiceStyle : undefined,
-    signal: opts.signal,
-  });
+
+  return createSpeech({ model: model.id, input, voice, signal: opts.signal });
 }

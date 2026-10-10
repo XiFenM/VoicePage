@@ -1,114 +1,148 @@
 import "server-only";
 import { config } from "./config";
 
+// ZenMux 客户端。接口约定见项目级 skill：
+//   .agents/skills/zenmux-context → docs_source/zh/api/openai/create-chat-completion.md
+//                                 → docs_source/zh/api/openai/create-audio-speech.md
+//                                 → docs_source/zh/guide/advanced/error-codes.md
+
 export class UpstreamError extends Error {
   constructor(
     message: string,
     public status: number,
+    public type?: string,
+    public requestId?: string,
   ) {
     super(message);
   }
 }
 
-async function ensureOk(res: Response, what: string) {
-  if (res.ok) return;
-  const body = await res.text().catch(() => "");
-  throw new UpstreamError(`${what} 失败 (${res.status}): ${body.slice(0, 500)}`, res.status);
+function headers(): HeadersInit {
+  return {
+    Authorization: `Bearer ${config.zenmuxApiKey}`,
+    "Content-Type": "application/json",
+    // 可选：在 ZenMux 日志中标识来源应用
+    "X-Title": "ReadAloud",
+  };
 }
 
-/** OpenAI 兼容的 chat completions */
+/** 解析 ZenMux 错误格式 `{ error: { code, type, message } }` */
+async function ensureOk(res: Response, what: string) {
+  if (res.ok) return;
+  const requestId = res.headers.get("X-ZenMux-RequestId") ?? undefined;
+  const text = await res.text().catch(() => "");
+  let type: string | undefined;
+  let message = text.slice(0, 500);
+  try {
+    const err = (JSON.parse(text) as { error?: { type?: string; message?: string } }).error;
+    if (err) {
+      type = err.type;
+      message = err.message ?? message;
+    }
+  } catch {}
+  const hint = ERROR_HINTS[type ?? ""] ?? "";
+  throw new UpstreamError(
+    `${what}失败 (${res.status}${type ? ` ${type}` : ""}): ${message}${hint ? ` —— ${hint}` : ""}${
+      requestId ? ` [RequestId: ${requestId}]` : ""
+    }`,
+    res.status,
+    type,
+    requestId,
+  );
+}
+
+const ERROR_HINTS: Record<string, string> = {
+  access_denied: "API Key 无效或缺失，检查 ZENMUX_API_KEY",
+  insufficient_credit: "账户欠费",
+  reject_no_credit: "余额不足",
+  quote_exceeded: "订阅配额用尽",
+  model_not_available: "该模型不在当前订阅计划中",
+  invalid_model: "模型不存在，检查模型 slug",
+  model_not_supported: "该模型不支持此 API",
+  rate_limit: "请求频率超限，稍后重试",
+};
+
+type JsonSchemaFormat = { name: string; schema: Record<string, unknown> };
+
+/** POST /chat/completions */
 export async function chatCompletion(opts: {
   model: string;
   messages: { role: "system" | "user" | "assistant"; content: string }[];
-  json?: boolean;
+  /** 结构化输出（json_schema 模式） */
+  schema?: JsonSchemaFormat;
   temperature?: number;
   signal?: AbortSignal;
 }): Promise<string> {
   const res = await fetch(`${config.zenmuxBaseUrl}/chat/completions`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.zenmuxApiKey}`,
-      "Content-Type": "application/json",
-    },
+    headers: headers(),
     body: JSON.stringify({
       model: opts.model,
       messages: opts.messages,
       temperature: opts.temperature ?? 0.7,
-      ...(opts.json ? { response_format: { type: "json_object" } } : {}),
+      ...(opts.schema
+        ? { response_format: { type: "json_schema", json_schema: { ...opts.schema, strict: true } } }
+        : {}),
     }),
     signal: opts.signal,
   });
-  await ensureOk(res, "调用 LLM");
+  await ensureOk(res, "调用 LLM ");
   const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
   const content = data.choices?.[0]?.message?.content;
   if (!content) throw new UpstreamError("LLM 返回为空", 502);
   return content;
 }
 
-/** OpenAI 兼容的 /audio/speech，返回音频二进制 */
-export async function openaiSpeech(opts: {
+/**
+ * POST /audio/speech
+ * 非流式时返回 JSON：{ audio: base64, mime_type: "audio/L16;rate=24000", usage }。
+ * 默认 response_format=pcm（16bit LE / 单声道 / 24kHz 裸 PCM），这里封装成 WAV 以便浏览器直接播放。
+ */
+export async function createSpeech(opts: {
   model: string;
   input: string;
-  voice: string;
-  instructions?: string;
+  voice?: string;
+  speed?: number;
   signal?: AbortSignal;
 }): Promise<{ audio: ArrayBuffer; mime: string }> {
   const res = await fetch(`${config.zenmuxBaseUrl}/audio/speech`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.zenmuxApiKey}`,
-      "Content-Type": "application/json",
-    },
+    headers: headers(),
     body: JSON.stringify({
       model: opts.model,
       input: opts.input,
       voice: opts.voice,
-      instructions: opts.instructions,
-      response_format: "mp3",
+      response_format: "pcm",
+      ...(opts.speed ? { speed: opts.speed } : {}),
     }),
     signal: opts.signal,
   });
-  await ensureOk(res, "调用 TTS");
-  return { audio: await res.arrayBuffer(), mime: res.headers.get("content-type") ?? "audio/mpeg" };
+  await ensureOk(res, "调用 TTS ");
+  const data = (await res.json()) as { audio?: string; mime_type?: string };
+  if (!data.audio) throw new UpstreamError("TTS 未返回音频", 502);
+  const bytes = Buffer.from(data.audio, "base64");
+  const mime = (data.mime_type ?? "audio/L16;rate=24000").toLowerCase();
+
+  // 已是带容器的格式（某些供应商可能返回 wav/mp3），直接透传
+  if (!mime.startsWith("audio/l16") && !mime.startsWith("audio/pcm")) {
+    return { audio: toArrayBuffer(bytes), mime: mime.split(";")[0] };
+  }
+  const rate = Number(mime.match(/rate=(\d+)/)?.[1] ?? 24000);
+  const channels = Number(mime.match(/channels=(\d+)/)?.[1] ?? 1);
+  return { audio: pcmToWav(bytes, rate, channels), mime: "audio/wav" };
 }
 
-/**
- * Gemini TTS（通过 ZenMux 的 Vertex AI 协议入口）。
- * 返回的是 24kHz / 16bit / 单声道 PCM，这里包装成 WAV。
- */
-export async function geminiSpeech(opts: {
-  model: string; // 例如 google/gemini-2.5-flash-preview-tts
-  text: string;
-  voice: string;
-  signal?: AbortSignal;
-}): Promise<{ audio: ArrayBuffer; mime: string }> {
-  const [publisher, name] = opts.model.includes("/") ? opts.model.split("/", 2) : ["google", opts.model];
-  const url = `${config.zenmuxVertexBaseUrl}/v1/publishers/${publisher}/models/${name}:generateContent`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.zenmuxApiKey}`,
-      "x-goog-api-key": config.zenmuxApiKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: opts.text }] }],
-      generationConfig: {
-        responseModalities: ["AUDIO"],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: opts.voice } } },
-      },
-    }),
-    signal: opts.signal,
-  });
-  await ensureOk(res, "调用 Gemini TTS");
-  const data = (await res.json()) as {
-    candidates?: { content?: { parts?: { inlineData?: { data?: string; mimeType?: string } }[] } }[];
-  };
-  const inline = data.candidates?.[0]?.content?.parts?.find((p) => p.inlineData?.data)?.inlineData;
-  if (!inline?.data) throw new UpstreamError("Gemini TTS 未返回音频", 502);
-  const pcm = Buffer.from(inline.data, "base64");
-  const rate = Number(inline.mimeType?.match(/rate=(\d+)/)?.[1] ?? 24000);
-  return { audio: pcmToWav(pcm, rate), mime: "audio/wav" };
+/** GET /models —— 列出可用模型（用于核对 TTS 模型） */
+export async function listModels(): Promise<
+  { id: string; display_name?: string; input_modalities?: string[]; output_modalities?: string[] }[]
+> {
+  const res = await fetch(`${config.zenmuxBaseUrl}/models`, { headers: headers() });
+  await ensureOk(res, "获取模型列表");
+  return ((await res.json()) as { data: [] }).data;
+}
+
+function toArrayBuffer(buf: Buffer): ArrayBuffer {
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
 }
 
 function pcmToWav(pcm: Buffer, sampleRate: number, channels = 1, bits = 16): ArrayBuffer {
@@ -127,6 +161,5 @@ function pcmToWav(pcm: Buffer, sampleRate: number, channels = 1, bits = 16): Arr
   header.writeUInt16LE(bits, 34);
   header.write("data", 36);
   header.writeUInt32LE(pcm.length, 40);
-  const out = Buffer.concat([header, pcm]);
-  return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
+  return toArrayBuffer(Buffer.concat([header, pcm]));
 }

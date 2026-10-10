@@ -19,6 +19,7 @@ export function Studio() {
   const [modelId, setModelId] = useState(TTS_MODELS[0].id);
   const [voice, setVoice] = useState(TTS_MODELS[0].defaultVoice);
   const [useTags, setUseTags] = useState(true);
+  const [useStyle, setUseStyle] = useState(true);
   const model = getTtsModel(modelId);
 
   // ---------- 结果 ----------
@@ -56,7 +57,7 @@ export function Studio() {
         const res = await fetch("/api/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: seg.tagged || seg.speech, modelId, voice, personaId }),
+          body: JSON.stringify({ text: seg.tagged || seg.speech, modelId, voice, personaId, useStyle }),
         });
         if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error ?? res.statusText);
         const blob = await res.blob();
@@ -67,7 +68,7 @@ export function Studio() {
         patchAudio(seg.id, { status: "error", error: (e as Error).message });
       }
     },
-    [modelId, voice, personaId],
+    [modelId, voice, personaId, useStyle],
   );
 
   /** 按顺序、限并发地为所有段生成音频（前面的段优先，便于尽早开始播放） */
@@ -199,15 +200,21 @@ export function Studio() {
           <Select label="讲述角色" value={personaId} onChange={setPersonaId} options={PERSONAS.map((p) => [p.id, p.label])} />
           <Select label="TTS 模型" value={modelId} onChange={changeModel} options={TTS_MODELS.map((m) => [m.id, m.label])} />
           <Select label="音色" value={voice} onChange={setVoice} options={model.voices.map((v) => [v.id, v.label])} />
-          <label className={`flex items-center gap-1 ${model.tagStyle === "none" ? "opacity-40" : ""}`}>
+          <label className={`flex items-center gap-1 ${model.tagSyntax === "none" ? "opacity-40" : ""}`}>
             <input
               type="checkbox"
-              checked={useTags && model.tagStyle !== "none"}
-              disabled={model.tagStyle === "none"}
+              checked={useTags && model.tagSyntax !== "none"}
+              disabled={model.tagSyntax === "none"}
               onChange={(e) => setUseTags(e.target.checked)}
             />
-            语气标签{model.tagStyle === "none" && "（该模型不支持）"}
+            语气标签{model.tagSyntax === "none" && "（该模型不支持）"}
           </label>
+          {model.styleMode !== "none" && (
+            <label className="flex items-center gap-1" title="在 TTS 输入前加一句角色对应的朗读风格说明">
+              <input type="checkbox" checked={useStyle} onChange={(e) => setUseStyle(e.target.checked)} />
+              角色语气
+            </label>
+          )}
           <button
             onClick={generate}
             disabled={!text.trim() || scriptLoading}
