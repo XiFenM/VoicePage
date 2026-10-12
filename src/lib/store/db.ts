@@ -12,7 +12,7 @@ import path from "node:path";
 export const DATA_DIR = path.resolve(/*turbopackIgnore: true*/ process.env.DATA_DIR ?? "data");
 export const AUDIO_DIR = path.join(/*turbopackIgnore: true*/ DATA_DIR, "audio");
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 7;
 
 declare global {
   var __readaloudDb: DatabaseSync | undefined;
@@ -100,6 +100,71 @@ function migrate(d: DatabaseSync) {
       CREATE INDEX idx_jobs_lease ON jobs(status, lease_until);
     `);
     if (version < 4) d.exec("ALTER TABLE segments ADD COLUMN audio_version TEXT;");
+    if (version < 5) d.exec(`
+      CREATE TABLE collections (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('group', 'session')),
+        name TEXT NOT NULL,
+        parent_id TEXT REFERENCES collections(id) ON DELETE SET NULL,
+        position INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK(kind != 'group' OR parent_id IS NULL)
+      );
+      CREATE INDEX idx_collections_parent_position ON collections(parent_id, position);
+      ALTER TABLE documents ADD COLUMN session_id TEXT REFERENCES collections(id) ON DELETE SET NULL;
+      ALTER TABLE documents ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+      CREATE INDEX idx_documents_session_position ON documents(session_id, position);
+      WITH ordered AS (
+        SELECT id, ROW_NUMBER() OVER (ORDER BY updated_at DESC, created_at DESC, id) - 1 AS position FROM documents
+      ) UPDATE documents SET position = (SELECT position FROM ordered WHERE ordered.id = documents.id);
+    `);
+    if (version < 6) d.exec(`
+      CREATE TABLE runtime_settings (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        task_concurrency INTEGER NOT NULL DEFAULT 4 CHECK(task_concurrency BETWEEN 1 AND 32),
+        text_concurrency INTEGER NOT NULL DEFAULT 4 CHECK(text_concurrency BETWEEN 1 AND 32),
+        tts_concurrency INTEGER NOT NULL DEFAULT 4 CHECK(tts_concurrency BETWEEN 1 AND 32),
+        segment_concurrency INTEGER NOT NULL DEFAULT 2 CHECK(segment_concurrency BETWEEN 1 AND 16),
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO runtime_settings (id, task_concurrency, text_concurrency, tts_concurrency, segment_concurrency, updated_at)
+        VALUES (1, 4, 4, 4, 2, 0);
+      CREATE TABLE model_permits (
+        token TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('text', 'tts')),
+        doc_id TEXT NOT NULL,
+        job_idx INTEGER NOT NULL,
+        job_owner TEXT NOT NULL,
+        job_attempt INTEGER NOT NULL,
+        lease_until INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX idx_model_permits_kind_lease ON model_permits(kind, lease_until);
+    `);
+    if (version < 7) d.exec(`
+      ALTER TABLE jobs ADD COLUMN auto_retry_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE jobs ADD COLUMN next_retry_at INTEGER;
+      ALTER TABLE jobs ADD COLUMN last_error_json TEXT;
+      ALTER TABLE jobs ADD COLUMN failure_phase TEXT;
+      ALTER TABLE jobs ADD COLUMN retry_source TEXT;
+      CREATE INDEX idx_jobs_retry_due ON jobs(status, next_retry_at, created_at);
+      CREATE TABLE generation_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        idx INTEGER NOT NULL,
+        phase TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        error_json TEXT,
+        retry_source TEXT,
+        retry_number INTEGER,
+        next_retry_at INTEGER,
+        model_id TEXT
+      );
+      CREATE INDEX idx_generation_events_document ON generation_events(doc_id, id DESC);
+    `);
     d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}; COMMIT;`);
   } catch (error) {
     d.exec("ROLLBACK");

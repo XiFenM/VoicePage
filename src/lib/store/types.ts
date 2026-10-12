@@ -10,8 +10,64 @@ export interface DocSettings {
   useStyle: boolean;
 }
 
+export type CollectionKind = "group" | "session";
+
+export interface LibraryCollection {
+  id: string;
+  kind: CollectionKind;
+  name: string;
+  parentId: string | null;
+  position: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface LibrarySnapshot {
+  collections: LibraryCollection[];
+  documents: DocSummary[];
+}
+
+export interface LibraryMove {
+  kind: CollectionKind | "document";
+  id: string;
+  parentId: string | null;
+  beforeId?: string | null;
+}
+
 export type BackgroundStatus = "idle" | "queued" | "running" | "completed" | "failed" | "cancelled";
 export type JobPhase = "queued" | "spoken" | "tags" | "tts";
+
+export interface JobErrorDetail {
+  category: "network" | "timeout" | "rate_limit" | "upstream" | "response" | "configuration" | "unknown";
+  message: string;
+  code?: string;
+  httpStatus?: number;
+  requestId?: string;
+  causes: { name: string; message: string; code?: string }[];
+  retryable: boolean;
+  retryAfterMs?: number;
+}
+
+export type RetrySource = "automatic" | "manual" | "recovery";
+
+export interface GenerationEvent {
+  id: number;
+  idx: number;
+  phase: JobPhase;
+  attempt: number;
+  type: "failed" | "retry_scheduled" | "retry_started" | "succeeded" | "cancelled" | "resumed";
+  createdAt: number;
+  error?: JobErrorDetail;
+  retrySource?: RetrySource;
+  retryNumber?: number;
+  nextRetryAt?: number;
+  modelId?: string;
+}
+
+export interface GenerationEventsPage {
+  events: GenerationEvent[];
+  nextCursor?: number;
+}
 
 export interface BackgroundProgress {
   status: BackgroundStatus;
@@ -29,12 +85,20 @@ export interface BackgroundProgress {
   error?: string;
   /** 仅有已完成段的实际耗时样本时返回；仍是粗估，不是服务承诺。 */
   estimatedRemainingMs?: number;
+  retryingSegments?: number;
+  nextRetryAt?: number;
+  failurePhase?: JobPhase;
 }
 
 export interface SegmentGeneration {
   status: BackgroundStatus;
   phase: JobPhase | "done";
   error?: string;
+  attempt?: number;
+  autoRetryCount?: number;
+  nextRetryAt?: number;
+  lastError?: JobErrorDetail;
+  failurePhase?: JobPhase;
 }
 
 /** owner + attempt 标识一次租约，旧 worker 无权写回被重新领取的任务。 */
@@ -53,6 +117,8 @@ export interface JobClaim {
 
 export interface DocSummary {
   id: string;
+  sessionId: string | null;
+  position: number;
   title: string;
   ttsModelId: string;
   voice: string;
@@ -83,6 +149,8 @@ export interface StoredSegment {
 
 export interface StoredDocument extends DocSettings {
   id: string;
+  sessionId: string | null;
+  position: number;
   title: string;
   sourceText: string;
   scriptModel?: string;

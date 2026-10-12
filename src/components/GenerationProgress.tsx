@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import type { BackgroundProgress } from "@/lib/store/types";
 import { backgroundPercent, backgroundStatusText, formatBackgroundElapsed, isBackgroundActive } from "./background-progress";
+import { generationPhaseLabel, MAX_AUTOMATIC_RETRIES, retryCountdown } from "./generation-history";
 
 function remainingTime(progress: BackgroundProgress): string {
   const value = "estimatedRemainingMs" in progress ? progress.estimatedRemainingMs : undefined;
@@ -32,6 +33,7 @@ export function GenerationProgress({ progress, busy, onStart, onRetry, onCancel 
   const elapsed = (active ? now : progress.finishedAt ?? progress.updatedAt) - startedAt;
   const unfinished = !progress.scriptReady || progress.completedSegments < progress.totalSegments;
   const failed = progress.status === "failed";
+  const waitingRetry = active && progress.nextRetryAt !== undefined;
 
   return (
     <section aria-label="后台生成进度" className={`space-y-3 rounded-xl border p-4 text-sm ${failed ? "border-red-200 bg-red-50 text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200" : "border-blue-200 bg-blue-50 text-blue-950 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100"}`}>
@@ -46,7 +48,7 @@ export function GenerationProgress({ progress, busy, onStart, onRetry, onCancel 
       {progress.scriptReady ? <>
         <div className="flex flex-wrap justify-between gap-2">
           <span>语音已完成 {progress.completedSegments}/{progress.totalSegments} 段</span>
-          <span>标签处理中 {progress.taggingSegments} · 语音生成中 {progress.speakingSegments} · 排队 {progress.queuedSegments}</span>
+          <span>标签处理中 {progress.taggingSegments} · 语音生成中 {progress.speakingSegments} · 排队 {progress.queuedSegments}{(progress.retryingSegments ?? 0) > 0 && ` · 自动重试 ${progress.retryingSegments} 段`}</span>
         </div>
         <div role="progressbar" aria-label="语音生成进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={backgroundPercent(progress)} className="h-2 overflow-hidden rounded-full bg-blue-100 dark:bg-blue-950">
           <div className="h-full bg-blue-600 transition-[width]" style={{ width: `${backgroundPercent(progress)}%` }} />
@@ -58,11 +60,14 @@ export function GenerationProgress({ progress, busy, onStart, onRetry, onCancel 
           : "原文已保存，正在等待后台处理。"}</p>}
       {progress.status !== "idle" && <p>{progress.startedAt ? "已用" : "已等待"} {formatBackgroundElapsed(elapsed)}</p>}
       {active && <>
+        {waitingRetry && <p className="rounded-lg bg-amber-100/60 px-3 py-2 text-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+          {progress.failurePhase ? `${generationPhaseLabel(progress.failurePhase)}暂时失败，` : ""}{retryCountdown(progress.nextRetryAt!, now)}。最多额外自动重试 {MAX_AUTOMATIC_RETRIES} 次，可随时停止生成。
+        </p>}
         <p>{remainingTime(progress)}</p>
-        <p className="text-xs opacity-80">可以切换记录、另建任务或关闭页面，后台会继续生成；所有记录合计最多同时处理 2 个任务。已完成的语音可以先听。</p>
+        <p className="text-xs opacity-80">可以切换记录、另建任务或关闭页面，后台会继续生成。实际并行速度由并发设置中的各项上限共同约束；已完成的语音可以先听。</p>
       </>}
       {progress.status === "cancelled" && <p>任务已停止，已保存的口述稿和语音仍可使用。需要时点击继续生成。</p>}
-      {progress.error && <p role="alert" className="break-all">{progress.error}</p>}
+      {progress.error && (failed || waitingRetry) && <p className="break-all">{failed && progress.failurePhase ? `${generationPhaseLabel(progress.failurePhase)}失败：` : waitingRetry ? "上次失败原因：" : ""}{progress.error}</p>}
     </section>
   );
 }

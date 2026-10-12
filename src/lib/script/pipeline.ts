@@ -1,7 +1,8 @@
 import "server-only";
 import { z } from "zod";
 import { config } from "@/lib/config";
-import { chatCompletion } from "@/lib/zenmux";
+import { chatCompletion, type ModelResponseMetadata } from "@/lib/zenmux";
+import { ModelResponseError } from "@/lib/generation/errors";
 import { TAG_PATTERN, formatTag, getPersona, getTtsModel, stripTags } from "@/lib/catalog";
 import { splitMarkdown, type SourceBlock } from "./segment";
 import type { ScriptResult, ScriptSegment } from "./types";
@@ -34,10 +35,14 @@ const SEGMENTS_JSON_SCHEMA = {
   },
 };
 
-function parseSegments(raw: string) {
+function parseSegments(raw: string, metadata: ModelResponseMetadata) {
   // 兼容模型把 JSON 包在 ```json 里的情况
   const json = raw.replace(/^\s*```(?:json)?\s*/i, "").replace(/```\s*$/, "");
-  return SegmentsSchema.parse(JSON.parse(json)).segments;
+  try {
+    return SegmentsSchema.parse(JSON.parse(json)).segments;
+  } catch (error) {
+    throw new ModelResponseError("模型返回的分段内容不符合预期格式", error, metadata.requestId, metadata.httpStatus);
+  }
 }
 
 /** 步骤 1：原文 -> 分块（本地） */
@@ -46,16 +51,18 @@ export { splitMarkdown };
 /** 步骤 2：分块 -> 口述稿（LLM） */
 export async function toSpoken(blocks: SourceBlock[], personaId: string, signal?: AbortSignal, scriptModel = config.scriptModel) {
   const persona = getPersona(personaId);
+  const metadata: ModelResponseMetadata = {};
   const raw = await chatCompletion({
     model: scriptModel,
     schema: SEGMENTS_JSON_SCHEMA,
     signal,
+    onResponse: (response) => { Object.assign(metadata, response); },
     messages: [
       { role: "system", content: spokenSystemPrompt(persona) },
       { role: "user", content: spokenUserPrompt(blocks) },
     ],
   });
-  const got = new Map(parseSegments(raw).map((s) => [s.id, stripTags(s.speech)]));
+  const got = new Map(parseSegments(raw, metadata).map((s) => [s.id, stripTags(s.speech)]));
   // 保证每个块都有口述稿；缺失时退化为原文去掉 Markdown 符号
   return blocks.map((b) => ({ id: b.id, speech: got.get(b.id) ?? fallbackSpeech(b) }));
 }
@@ -72,17 +79,19 @@ export async function addTags(
   if (model.tagSyntax === "none" || model.tags.length === 0) {
     return segments.map((s) => ({ ...s, tagged: s.speech }));
   }
+  const metadata: ModelResponseMetadata = {};
   const raw = await chatCompletion({
     model: scriptModel,
     schema: SEGMENTS_JSON_SCHEMA,
     signal,
+    onResponse: (response) => { Object.assign(metadata, response); },
     messages: [
       { role: "system", content: tagSystemPrompt(model, getPersona(personaId)) },
       { role: "user", content: tagUserPrompt(segments) },
     ],
   });
   const allowed = new Set(model.tags.map((t) => formatTag(model.tagSyntax, t.name)));
-  const got = new Map(parseSegments(raw).map((s) => [s.id, s.speech]));
+  const got = new Map(parseSegments(raw, metadata).map((s) => [s.id, s.speech]));
   return segments.map((s) => {
     let tagged = got.get(s.id) ?? s.speech;
     // 去掉模型自创的标签

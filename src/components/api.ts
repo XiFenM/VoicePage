@@ -1,6 +1,8 @@
 // 前端调用后端 API 的薄封装
-import type { DocSettings, DocSummary, StoredDocument } from "@/lib/store/types";
+import type { CollectionKind, DocSettings, DocSummary, GenerationEventsPage, LibraryCollection, LibrarySnapshot, StoredDocument } from "@/lib/store/types";
 import type { ImportResult } from "@/lib/store/backup";
+import type { RuntimeSettings } from "@/lib/runtime-settings";
+import type { LibraryMove } from "./library-tree";
 
 function checkAuth(res: Response) {
   if (res.status === 401) {
@@ -32,7 +34,18 @@ const json = (method: string, body: unknown): RequestInit => ({
 export const api = {
   list: () => call<DocSummary[]>("/api/documents", { cache: "no-store" }),
   get: (id: string) => call<StoredDocument>(`/api/documents/${id}`, { cache: "no-store" }),
-  create: (body: DocSettings & { text: string }) => call<StoredDocument>("/api/documents", json("POST", body)),
+  generationEvents: (id: string, before?: number, signal?: AbortSignal) =>
+    call<GenerationEventsPage>(`/api/documents/${id}/events?limit=50${before === undefined ? "" : `&before=${before}`}`, { cache: "no-store", signal }),
+  create: (body: DocSettings & { text: string; sessionId?: string | null }) => call<StoredDocument>("/api/documents", json("POST", body)),
+  library: () => call<LibrarySnapshot>("/api/library", { cache: "no-store" }),
+  createCollection: (body: { kind: CollectionKind; name: string; parentId?: string | null; beforeId?: string | null }) =>
+    call<LibraryCollection>("/api/collections", json("POST", body)),
+  updateCollection: (id: string, body: { name?: string; parentId?: string | null; beforeId?: string | null }) =>
+    call<LibraryCollection>(`/api/collections/${id}`, json("PATCH", body)),
+  removeCollection: (id: string) => call<{ ok: true }>(`/api/collections/${id}`, { method: "DELETE" }),
+  moveLibraryItem: (body: LibraryMove) => call<LibrarySnapshot>("/api/library/move", json("POST", body)),
+  runtimeSettings: () => call<RuntimeSettings>("/api/settings", { cache: "no-store" }),
+  saveRuntimeSettings: (settings: RuntimeSettings) => call<RuntimeSettings>("/api/settings", json("PATCH", settings)),
   update: (id: string, patch: Partial<DocSettings> & { title?: string }) =>
     call<StoredDocument>(`/api/documents/${id}`, json("PATCH", patch)),
   remove: (id: string) => call<{ ok: true }>(`/api/documents/${id}`, { method: "DELETE" }),

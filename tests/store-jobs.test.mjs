@@ -24,6 +24,7 @@ const store = await import("../src/lib/store/documents.ts");
 const jobs = await import("../src/lib/store/jobs.ts");
 const backup = await import("../src/lib/store/backup.ts");
 const { db } = await import("../src/lib/store/db.ts");
+const { updateRuntimeSettings } = await import("../src/lib/store/runtime-settings.ts");
 const settings = { personaId: "teacher", ttsModelId: "google/gemini-3.1-flash-tts-preview", voice: "Sulafat", useTags: false, useStyle: true };
 const blocks = [{ id: 0, kind: "text", markdown: "原文第一段" }, { id: 1, kind: "text", markdown: "原文第二段" }];
 const segments = [{ id: 0, speech: "口述第一段", tagged: "口述第一段" }, { id: 1, speech: "口述第二段", tagged: "口述第二段" }];
@@ -97,7 +98,8 @@ test("claiming is globally bounded and repeated start does not reset an in-fligh
   assert.deepEqual({ ...row }, { attempt: 1, owner: "a", force: 0 });
 });
 
-test("independent processes share the same two-job concurrency cap", async () => {
+test("independent processes share the configured two-document concurrency cap", async () => {
+  updateRuntimeSettings({ taskConcurrency: 2 });
   draft(); draft(); draft();
   const runtime = `import {registerHooks} from 'node:module'; import {existsSync} from 'node:fs'; import path from 'node:path'; import {fileURLToPath,pathToFileURL} from 'node:url'; const repo=${JSON.stringify(repo)}; registerHooks({resolve:${resolveStore.toString()}}); const {claimNextJob}=await import(${JSON.stringify(pathToFileURL(path.join(repo, "src/lib/store/jobs.ts")).href)});`;
   const claimInProcess = (owner) => new Promise((resolve, reject) => {
@@ -112,6 +114,7 @@ test("independent processes share the same two-job concurrency cap", async () =>
   const claims = await Promise.all([claimInProcess("process-a"), claimInProcess("process-b"), claimInProcess("process-c")]);
   assert.equal(claims.filter(Boolean).length, 2);
   assert.equal(db().prepare("SELECT COUNT(*) AS n FROM jobs WHERE status='running'").get().n, 2);
+  updateRuntimeSettings({ taskConcurrency: 4 });
 });
 
 test("expired running jobs resume their phase and stale owner/attempt cannot mutate or renew them", () => {
@@ -224,14 +227,16 @@ test("backup preserves draft/results but pauses every incomplete job until expli
   assert.equal(jobs.claimNextJob("explicit").kind, "script");
 });
 
-test("backup overwrite may reset attempt, but a new claim owner fences the pre-import worker", () => {
+test("legacy backup overwrite may reset attempt, but a new claim owner fences the pre-import worker", () => {
   const doc = ready(1);
   jobs.enqueueDocumentJobs(doc.id);
   const oldClaim = jobs.claimNextJob("executor:old-unique-owner");
   const oldSnapshot = store.getSegmentForTts(doc.id, 0);
-  const zip = backup.exportBackup([doc.id]).zip;
-
-  backup.importBackup(zip, "overwrite");
+  const entries = unzipSync(backup.exportBackup([doc.id]).zip);
+  const manifest = JSON.parse(Buffer.from(entries["manifest.json"]).toString());
+  manifest.version = 4; // 旧备份没有持久 attempt；当前 v5 会保留它。
+  entries["manifest.json"] = Buffer.from(JSON.stringify(manifest));
+  backup.importBackup(zipSync(entries), "overwrite");
   assert.equal(jobs.isJobOwned(oldClaim), false);
   assert.equal(store.getDocument(doc.id).generation.status, "cancelled");
   jobs.enqueueDocumentJobs(doc.id);
@@ -278,6 +283,7 @@ test("ETA is based on completed segment durations and disappears when running ex
   db().prepare("UPDATE jobs SET started_at=?, finished_at=? WHERE doc_id=? AND idx=?").run(now - 11_000, now - 1_000, doc.id, first.idx);
   assert.equal(jobs.getBackgroundProgress(doc.id).estimatedRemainingMs, undefined);
   const next = jobs.claimNextJob("next");
+  jobs.setJobPhase(next, "tts");
   assert.ok(jobs.getBackgroundProgress(doc.id).estimatedRemainingMs > 0);
   db().prepare("UPDATE jobs SET started_at=? WHERE doc_id=? AND idx=?").run(now - 30_000, doc.id, next.idx);
   assert.equal(jobs.getBackgroundProgress(doc.id).estimatedRemainingMs, undefined);

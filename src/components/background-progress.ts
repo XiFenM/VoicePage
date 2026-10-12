@@ -18,6 +18,7 @@ export function documentProgress(doc: StoredDocument | DocSummary): BackgroundPr
 }
 
 export function backgroundStatusText(progress: BackgroundProgress): string {
+  if (progress.status === "queued" && progress.nextRetryAt) return "等待自动重试";
   if (progress.status === "queued") return "排队中";
   if (progress.status === "running") return progress.phase === "spoken" ? "口述稿生成中" : `语音 ${progress.completedSegments}/${progress.totalSegments}`;
   if (progress.status === "failed") return progress.scriptReady ? `生成失败${progress.failedSegments ? ` · ${progress.failedSegments} 段` : ""}` : "口述稿生成失败";

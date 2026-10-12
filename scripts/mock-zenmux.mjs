@@ -8,9 +8,13 @@
  * Markers in source text (preserved in the fake spoken script):
  *   MOCK_LLM_ERROR / MOCK_LLM_RETRY / MOCK_TAG_ERROR / MOCK_TAG_RETRY
  *   MOCK_TTS_ERROR / MOCK_TTS_RETRY
+ *   MOCK_{LLM|TAG|TTS}_NETWORK_ONCE (destroy the socket without a response)
+ *   MOCK_{LLM|TAG|TTS}_HTTP_{400|403}_ONCE (permanent HTTP failure once)
+ *   MOCK_{LLM|TAG|TTS}_HTTP_503_THREE (fail three requests, then succeed)
  *   MOCK_SLOW_SPOKEN (20s) / MOCK_SLOW_TAGS (20s) / MOCK_SLOW_TTS (12s)
  * *_RETRY markers fail once per distinct input, then succeed.
  * Add MOCK_CASE_example to correlate a segment's tag and TTS requests in logs.
+ * Add the same MOCK_DOC_example marker to every segment to measure active docs.
  * GET /__mock/status returns stage timings/counts and synthetic case IDs only.
  *
  * Import createMockZenmux({ spokenMs, tagsMs, speechMs }) for faster API tests.
@@ -39,9 +43,9 @@ function json(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
-function failure(response, stage) {
-  json(response, 503, {
-    error: { code: "mock_failure", type: "mock_failure", message: `模拟 ${stage} 失败，请重试` },
+function failure(response, stage, status = 503) {
+  json(response, status, {
+    error: { code: "mock_failure", type: "mock_failure", message: `模拟 ${stage} HTTP ${status} 失败` },
   });
 }
 
@@ -65,11 +69,19 @@ export function createMockZenmux({ spokenMs = 2500, tagsMs = 7000, speechMs = 50
   let requestId = 0;
   let activeRequests = 0;
   let maxActiveRequests = 0;
+  let activeTextRequests = 0;
+  let activeTtsRequests = 0;
+  let maxTextRequests = 0;
+  let maxTtsRequests = 0;
+  let maxActiveDocuments = 0;
+  const activeEvents = new Map();
+  const activeDocumentKeys = () => [...new Set([...activeEvents.values()].flatMap((event) => event.documents))];
+  const stats = () => ({ activeRequests, maxActiveRequests, activeTextRequests, activeTtsRequests, maxTextRequests, maxTtsRequests, activeDocuments: activeDocumentKeys().length, maxActiveDocuments });
 
   const server = http.createServer(async (request, response) => {
     const pathname = new URL(request.url, "http://127.0.0.1").pathname;
     if (request.method === "GET" && pathname === "/__mock/status") {
-      return json(response, 200, { fixture: "voicepage-local-zenmux", activeRequests, maxActiveRequests, events });
+      return json(response, 200, { fixture: "voicepage-local-zenmux", ...stats(), events });
     }
     if (request.method !== "POST" || !["/api/v1/chat/completions", "/api/v1/audio/speech"].includes(pathname)) {
       return json(response, 404, { error: "Unknown mock endpoint" });
@@ -94,11 +106,19 @@ export function createMockZenmux({ spokenMs = 2500, tagsMs = 7000, speechMs = 50
     const stage = isSpeech ? "tts" : isTags ? "tags" : "spoken";
     const input = isSpeech ? String(body.input ?? "") : body.messages?.find((message) => message.role === "user")?.content ?? "";
     const cases = [...new Set(input.match(/MOCK_CASE_[a-zA-Z0-9_]+/g) ?? [])];
-    const event = { id: ++requestId, stage, cases, startedAt: Date.now(), finishedAt: null, status: "running" };
+    const documents = [...new Set(input.match(/MOCK_DOC_[a-zA-Z0-9_]+/g) ?? [])];
+    const event = { id: ++requestId, stage, cases, documents, startedAt: Date.now(), finishedAt: null, status: "running" };
     events.push(event);
     if (events.length > 1000) events.shift();
     activeRequests++;
     maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+    if (isSpeech) activeTtsRequests++;
+    else activeTextRequests++;
+    maxTextRequests = Math.max(maxTextRequests, activeTextRequests);
+    maxTtsRequests = Math.max(maxTtsRequests, activeTtsRequests);
+    activeEvents.set(event.id, event);
+    maxActiveDocuments = Math.max(maxActiveDocuments, activeDocumentKeys().length);
+    event.activeAtStart = stats();
     changes.emit("change", event);
     const attemptKey = `${stage}:${input}`;
     const attempt = (attempts.get(attemptKey) ?? 0) + 1;
@@ -107,19 +127,34 @@ export function createMockZenmux({ spokenMs = 2500, tagsMs = 7000, speechMs = 50
     const connected = await waitForResponse(delay, response);
     event.finishedAt = Date.now();
     activeRequests--;
+    if (isSpeech) activeTtsRequests--;
+    else activeTextRequests--;
+    activeEvents.delete(event.id);
     if (!connected) {
       event.status = "cancelled";
       changes.emit("change", event);
       return;
     }
 
-    const shouldFail = (stage === "spoken" && (input.includes("MOCK_LLM_ERROR") || (input.includes("MOCK_LLM_RETRY") && attempt === 1))) ||
+    const prefix = stage === "spoken" ? "LLM" : stage === "tags" ? "TAG" : "TTS";
+    const networkFailure = input.includes(`MOCK_${prefix}_NETWORK_ALWAYS`) || (input.includes(`MOCK_${prefix}_NETWORK_ONCE`) && attempt === 1);
+    const permanentStatus = [400, 403].find((status) => input.includes(`MOCK_${prefix}_HTTP_${status}_ALWAYS`) || (input.includes(`MOCK_${prefix}_HTTP_${status}_ONCE`) && attempt === 1));
+    const shouldFail = permanentStatus || (input.includes(`MOCK_${prefix}_HTTP_503_THREE`) && attempt <= 3) || (stage === "spoken" && (input.includes("MOCK_LLM_ERROR") || (input.includes("MOCK_LLM_RETRY") && attempt === 1))) ||
       (stage === "tags" && (input.includes("MOCK_TAG_ERROR") || (input.includes("MOCK_TAG_RETRY") && attempt === 1))) ||
       (isSpeech && (input.includes("MOCK_TTS_ERROR") || (input.includes("MOCK_TTS_RETRY") && attempt === 1)));
+    if (networkFailure) {
+      event.status = "failed";
+      event.failureKind = "network";
+      changes.emit("change", event);
+      request.socket.destroy();
+      return;
+    }
     if (shouldFail) {
       event.status = "failed";
+      event.httpStatus = permanentStatus ?? 503;
+      response.setHeader("X-ZenMux-RequestId", `mock-${stage}-${event.id}`);
       changes.emit("change", event);
-      return failure(response, stage);
+      return failure(response, stage, event.httpStatus);
     }
 
     try {
@@ -146,7 +181,7 @@ export function createMockZenmux({ spokenMs = 2500, tagsMs = 7000, speechMs = 50
       return json(response, 400, { error: { type: "mock_input", message: "Unrecognized mock prompt" } });
     }
   });
-  return { server, events, changes, stats: () => ({ activeRequests, maxActiveRequests }) };
+  return { server, events, changes, stats };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

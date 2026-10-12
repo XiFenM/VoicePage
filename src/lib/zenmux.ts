@@ -1,5 +1,8 @@
 import "server-only";
 import { config } from "./config";
+import { ModelResponseError } from "./generation/errors";
+import { parseRetryAfter } from "./generation/retry-policy";
+import { modelFetch } from "./model-http";
 
 // ZenMux 客户端。接口约定见项目级 skill：
 //   .agents/skills/zenmux-context → docs_source/zh/api/openai/create-chat-completion.md
@@ -7,13 +10,23 @@ import { config } from "./config";
 //                                 → docs_source/zh/guide/advanced/error-codes.md
 
 export class UpstreamError extends Error {
+  status: number;
+  type?: string;
+  requestId?: string;
+  retryAfterMs?: number;
   constructor(
     message: string,
-    public status: number,
-    public type?: string,
-    public requestId?: string,
+    status: number,
+    type?: string,
+    requestId?: string,
+    retryAfterMs?: number,
   ) {
     super(message);
+    this.name = "UpstreamError";
+    this.status = status;
+    this.type = type;
+    this.requestId = requestId;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -32,7 +45,7 @@ async function ensureOk(res: Response, what: string) {
   const requestId = res.headers.get("X-ZenMux-RequestId") ?? undefined;
   const text = await res.text().catch(() => "");
   let type: string | undefined;
-  let message = text.slice(0, 500);
+  let message = res.statusText || "上游接口返回非 JSON 错误响应";
   try {
     const err = (JSON.parse(text) as { error?: { type?: string; message?: string } }).error;
     if (err) {
@@ -48,7 +61,22 @@ async function ensureOk(res: Response, what: string) {
     res.status,
     type,
     requestId,
+    parseRetryAfter(res.headers.get("Retry-After")),
   );
+}
+
+async function readModelJson<T>(res: Response): Promise<T> {
+  const requestId = res.headers.get("X-ZenMux-RequestId") ?? undefined;
+  try {
+    const data: unknown = await res.json();
+    if (!data || typeof data !== "object") throw new ModelResponseError("模型接口未返回有效 JSON 对象", undefined, requestId, res.status);
+    return data as T;
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new ModelResponseError("模型接口返回了无法解析的 JSON", error, requestId, res.status);
+    if (error instanceof ModelResponseError) throw error;
+    // 读取响应体时也可能断线/超时，保留 cause 以区分网络故障和 JSON 格式错误。
+    throw Object.assign(new Error("接收模型接口响应失败", { cause: error }), { requestId, httpStatus: res.status });
+  }
 }
 
 const ERROR_HINTS: Record<string, string> = {
@@ -63,6 +91,7 @@ const ERROR_HINTS: Record<string, string> = {
 };
 
 type JsonSchemaFormat = { name: string; schema: Record<string, unknown> };
+export type ModelResponseMetadata = { requestId?: string; httpStatus?: number };
 
 /** POST /chat/completions */
 export async function chatCompletion(opts: {
@@ -72,8 +101,10 @@ export async function chatCompletion(opts: {
   schema?: JsonSchemaFormat;
   temperature?: number;
   signal?: AbortSignal;
+  /** 供结构化内容校验继续携带请求编号，不包含请求/响应正文。 */
+  onResponse?: (metadata: ModelResponseMetadata) => void;
 }): Promise<string> {
-  const res = await fetch(`${config.zenmuxBaseUrl}/chat/completions`, {
+  const res = await modelFetch(`${config.zenmuxBaseUrl}/chat/completions`, {
     method: "POST",
     headers: headers(),
     body: JSON.stringify({
@@ -87,10 +118,11 @@ export async function chatCompletion(opts: {
     }),
     signal: opts.signal,
   });
+  opts.onResponse?.({ requestId: res.headers.get("X-ZenMux-RequestId") ?? undefined, httpStatus: res.status });
   await ensureOk(res, "调用 LLM ");
-  const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+  const data = await readModelJson<{ choices?: { message?: { content?: string } }[] }>(res);
   const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new UpstreamError("LLM 返回为空", 502);
+  if (typeof content !== "string" || !content.trim()) throw new ModelResponseError("LLM 返回为空或不是文本", undefined, res.headers.get("X-ZenMux-RequestId") ?? undefined, res.status);
   return content;
 }
 
@@ -110,7 +142,7 @@ export async function createSpeech(opts: {
   voice?: string;
   signal?: AbortSignal;
 }): Promise<SpeechResult> {
-  const res = await fetch(`${config.zenmuxBaseUrl}/audio/speech`, {
+  const res = await modelFetch(`${config.zenmuxBaseUrl}/audio/speech`, {
     method: "POST",
     headers: headers(),
     body: JSON.stringify({
@@ -122,8 +154,8 @@ export async function createSpeech(opts: {
     signal: opts.signal,
   });
   await ensureOk(res, "调用 TTS ");
-  const data = (await res.json()) as { audio?: string; mime_type?: string };
-  if (!data.audio) throw new UpstreamError("TTS 未返回音频", 502);
+  const data = await readModelJson<{ audio?: string; mime_type?: string }>(res);
+  if (typeof data.audio !== "string" || !data.audio) throw new ModelResponseError("TTS 未返回音频", undefined, res.headers.get("X-ZenMux-RequestId") ?? undefined, res.status);
   const bytes = Buffer.from(data.audio, "base64");
   const mime = (data.mime_type ?? "audio/L16;rate=24000").toLowerCase();
 
@@ -143,7 +175,7 @@ export async function createSpeech(opts: {
 export async function listModels(): Promise<
   { id: string; display_name?: string; input_modalities?: string[]; output_modalities?: string[] }[]
 > {
-  const res = await fetch(`${config.zenmuxBaseUrl}/models`, { headers: headers() });
+  const res = await modelFetch(`${config.zenmuxBaseUrl}/models`, { headers: headers() });
   await ensureOk(res, "获取模型列表");
   return ((await res.json()) as { data: [] }).data;
 }

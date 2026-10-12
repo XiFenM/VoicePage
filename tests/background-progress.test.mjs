@@ -101,6 +101,7 @@ test("历史状态明确区分口述稿、语音进度、失败和停止", () =>
   assert.equal(backgroundStatusText(progress({ status: "cancelled" })), "已停止");
   assert.equal(backgroundStatusText(progress({ status: "failed", failedSegments: 1 })), "生成失败 · 1 段");
   assert.equal(backgroundStatusText(progress({ status: "queued" })), "排队中");
+  assert.equal(backgroundStatusText(progress({ status: "queued", nextRetryAt: 10_000 })), "等待自动重试");
 });
 
 test("草稿和空队列不显示虚假完成比例，正常进度按服务端完成段数", () => {

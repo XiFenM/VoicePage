@@ -5,6 +5,7 @@ import { listDocuments } from "@/lib/store/documents";
 import { createQueuedDocument } from "@/lib/store/jobs";
 import { startBackgroundWorker } from "@/lib/generation/worker";
 import { errorResponse } from "@/lib/http";
+import { LibraryError } from "@/lib/store/organization";
 
 /** 历史与持久进度，读取不会重新提交已完成或失败的任务。 */
 export async function GET() {
@@ -18,6 +19,7 @@ export async function GET() {
 }
 
 const Body = z.object({
+  sessionId: z.string().min(1).nullable().optional(),
   text: z.string().max(30000).refine((text) => text.trim().length > 0, "原文为空"),
   personaId: z.string().default("teacher"),
   ttsModelId: z.string(),
@@ -30,10 +32,11 @@ const Body = z.object({
 export async function POST(request: Request) {
   try {
     const body = Body.parse(await request.json());
-    const doc = createQueuedDocument({ sourceText: body.text, settings: body, scriptModel: config.scriptModel });
+    const doc = createQueuedDocument({ sourceText: body.text, settings: body, scriptModel: config.scriptModel, sessionId: body.sessionId });
     startBackgroundWorker();
     return Response.json(doc, { status: 202, headers: { "Cache-Control": "no-store" } });
   } catch (error) {
+    if (error instanceof LibraryError) return Response.json({ error: error.message }, { status: error.status });
     return errorResponse(error);
   }
 }

@@ -9,6 +9,8 @@ import type { SourceBlock } from "@/lib/script/segment";
 import type { ScriptSegment } from "@/lib/script/types";
 import { stripTags } from "@/lib/catalog";
 import { effectiveTagStatus, isAudioFresh, needsAutomaticTags } from "./audio-state";
+import { assertSession, nextDocumentPosition } from "./organization";
+import { recordJobSuccess } from "./generation-events";
 
 export { audioHash, needsAutomaticTags } from "./audio-state";
 
@@ -37,7 +39,7 @@ export function makeTitle(source: string): string {
 export function listDocuments(): DocSummary[] {
   const rows = db()
     .prepare(
-      `SELECT d.id, d.title, d.tts_model_id, d.voice, d.created_at, d.updated_at,
+      `SELECT d.id, d.session_id, d.position, d.title, d.tts_model_id, d.voice, d.created_at, d.updated_at,
               COUNT(s.idx) AS seg_count, COUNT(s.audio_file) AS audio_count
          FROM documents d LEFT JOIN segments s ON s.doc_id = d.id
         GROUP BY d.id ORDER BY d.updated_at DESC`,
@@ -45,6 +47,8 @@ export function listDocuments(): DocSummary[] {
     .all() as Row[];
   return rows.map((r) => ({
     id: r.id as string,
+    sessionId: r.session_id as string | null,
+    position: Number(r.position),
     title: r.title as string,
     ttsModelId: r.tts_model_id as string,
     voice: r.voice as string,
@@ -63,6 +67,8 @@ export function getDocument(id: string): StoredDocument | null {
   const segs = db().prepare("SELECT * FROM segments WHERE doc_id = ? ORDER BY idx").all(id) as Row[];
   return {
     id,
+    sessionId: d.session_id as string | null,
+    position: Number(d.position),
     title: d.title as string,
     sourceText: d.source_text as string,
     scriptModel: (d.script_model as string) ?? undefined,
@@ -107,6 +113,7 @@ function toStoredSegment(docId: string, s: Row, settings: DocSettings): StoredSe
 
 export function createDocument(input: {
   sourceText: string;
+  sessionId?: string | null;
   settings: DocSettings;
   scriptModel: string;
   blocks: SourceBlock[];
@@ -117,12 +124,14 @@ export function createDocument(input: {
   const s = input.settings;
   const pending = needsAutomaticTags(s);
   tx(() => {
+    const sessionId = input.sessionId ?? null;
+    assertSession(sessionId);
     db()
       .prepare(
-        `INSERT INTO documents (id, title, source_text, persona_id, tts_model_id, voice, use_tags, use_style, script_model, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO documents (id, title, source_text, persona_id, tts_model_id, voice, use_tags, use_style, script_model, created_at, updated_at, session_id, position)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, makeTitle(input.sourceText), input.sourceText, s.personaId, s.ttsModelId, s.voice, +s.useTags, +s.useStyle, input.scriptModel, now, now);
+      .run(id, makeTitle(input.sourceText), input.sourceText, s.personaId, s.ttsModelId, s.voice, +s.useTags, +s.useStyle, input.scriptModel, now, now, sessionId, nextDocumentPosition(sessionId));
     const ins = db().prepare(
       `INSERT INTO segments (doc_id, idx, kind, lang, markdown, speech, tagged, tag_status, tag_model_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
@@ -245,9 +254,10 @@ export function saveSegmentAudio(
       )
       .run(rel, meta.hash, crypto.randomUUID(), audio.length, meta.modelId, meta.voice, now, id, idx);
     if (claim) {
+      recordJobSuccess(claim, "tts", meta.modelId);
       // 已在事务开头验证 owner；持锁期间不会被其他进程重新领取。
       db().prepare(`UPDATE jobs SET status = 'completed', phase = 'tts', owner = NULL, lease_until = NULL,
-        error = NULL, finished_at = ?, updated_at = ? WHERE doc_id = ? AND idx = ? AND owner = ? AND attempt = ?`)
+        error = NULL, next_retry_at = NULL, finished_at = ?, updated_at = ? WHERE doc_id = ? AND idx = ? AND owner = ? AND attempt = ?`)
         .run(now, now, id, idx, claim.owner, claim.attempt);
     }
     touch(id, now);

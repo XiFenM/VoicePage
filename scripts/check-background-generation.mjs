@@ -169,6 +169,10 @@ try {
   const login = await fetch(`${app}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "voicepage-test" }) });
   assert.equal(login.status, 200);
   cookie = login.headers.get("set-cookie").split(";")[0];
+  const limits = { taskConcurrency: 2, textConcurrency: 2, ttsConcurrency: 2, segmentConcurrency: 2 };
+  const configured = await request("/api/settings", "PATCH", limits);
+  assert.equal(configured.status, 200);
+  assert.deepEqual(configured.body, limits);
 
   const detached = await create("detached", 2);
   await completed("detached", detached, 2);
@@ -178,10 +182,10 @@ try {
   // Reading another completed document must not switch away from server work.
   assert.equal((await inspect(detached.id)).generation.status, "completed");
   await Promise.all([completed("parallelA", first, 2), completed("parallelB", second, 2)]);
-  assert.ok(mock.stats().maxActiveRequests <= 2, JSON.stringify(mock.stats()));
+  assert.ok(mock.stats().maxTextRequests <= 2 && mock.stats().maxTtsRequests <= 2 && mock.stats().maxActiveRequests <= 4, JSON.stringify(mock.stats()));
   console.log(JSON.stringify({ check: "two documents continue while reading an old document", ...mock.stats() }));
 
-  const failed = await create("retry", 1, "MOCK_LLM_RETRY");
+  const failed = await create("retry", 1, "MOCK_LLM_HTTP_400_ONCE");
   await waitMock(() => matching("retry", "spoken", "failed").length === 1, "First model failure was not observed");
   await delay(700);
   const failureState = await inspect(failed.id);
@@ -194,7 +198,7 @@ try {
   assert.equal(matching("retry", "spoken").length, 2);
   console.log("PASS: model failure remains persisted until explicit retry, then completes");
 
-  const segmentFailures = await create("segmentfail", 3, (idx) => ["", "MOCK_TAG_RETRY", "MOCK_TTS_RETRY"][idx]);
+  const segmentFailures = await create("segmentfail", 3, (idx) => ["", "MOCK_TAG_HTTP_403_ONCE", "MOCK_TTS_HTTP_403_ONCE"][idx]);
   await waitMock(() => matching("segmentfail", "tts", "complete").length === 1 && matching("segmentfail", "tags", "failed").length === 1 && matching("segmentfail", "tts", "failed").length === 1, "Segment failures should not stop the independent successful segment");
   await delay(700);
   const partial = await inspect(segmentFailures.id);
@@ -243,7 +247,7 @@ try {
   assert.equal(matching("leaseA", "spoken").length, 2);
   assert.equal(matching("leaseB", "spoken").length, 2);
   assert.equal(matching("queued", "spoken").length, 1);
-  assert.ok(mock.stats().maxActiveRequests <= 2, JSON.stringify(mock.stats()));
+  assert.ok(mock.stats().maxTextRequests <= 2 && mock.stats().maxTtsRequests <= 2 && mock.stats().maxActiveRequests <= 4, JSON.stringify(mock.stats()));
   console.log(JSON.stringify({ check: "restart recovers queued and expired leases without any browser request", ...mock.stats() }));
   console.log("All background generation lifecycle checks passed.");
 } catch (error) {
