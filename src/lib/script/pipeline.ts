@@ -107,9 +107,10 @@ export async function runScriptPipeline(input: {
   personaId: string;
   signal?: AbortSignal;
   scriptModel?: string;
+  preparedBlocks?: SourceBlock[];
 }): Promise<ScriptResult> {
   input.signal?.throwIfAborted();
-  const blocks = splitMarkdown(input.text);
+  const blocks = input.preparedBlocks ?? splitMarkdown(input.text);
   if (blocks.length === 0) return { blocks, segments: [] };
   const model = input.scriptModel ?? config.scriptModel;
   const spoken = await toSpoken(blocks, input.personaId, input.signal, model);

@@ -1,17 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { stripTags } from "@/lib/catalog";
 import type { DocSettings, StoredDocument, StoredSegment } from "@/lib/store/types";
 import { api } from "./api";
 import { SettingsBar } from "./SettingsBar";
+import { MarkdownContent } from "./MarkdownContent";
 import { GenerationProgress } from "./GenerationProgress";
 import { GenerationError } from "./GenerationError";
 import { GenerationHistory, type GenerationHistoryFilter } from "./GenerationHistory";
 import { automaticRetryLabel, generationPhaseLabel, MAX_AUTOMATIC_RETRIES } from "./generation-history";
-import { documentProgress, editedSinceSnapshot, mergeDocumentSnapshot } from "./background-progress";
+import { documentProgress, editedSinceSnapshot, isBackgroundActive, mergeDocumentSnapshot } from "./background-progress";
+import { ACTIVE_POLL_MS, createVisibilityPoller, IDLE_POLL_MS, type VisibilityPoller } from "./visibility-poller";
 
 const SAVE_DEBOUNCE_MS = 800;
 const segmentBusy = (segment: StoredSegment) => segment.generation?.status === "queued" || segment.generation?.status === "running";
@@ -23,6 +23,7 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
   const docRef = useRef(initialDoc);
   const [current, setCurrent] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const playingRef = useRef(false);
   const [showScript, setShowScript] = useState(true);
   const [rate, setRate] = useState(1);
   const [saving, setSaving] = useState<"saved" | "saving" | "error">("saved");
@@ -42,6 +43,7 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
   const saveRequests = useRef<Record<number, Promise<void>>>({});
   const unsaved = useRef<Record<number, string>>({});
   const editRevisions = useRef<Record<number, number>>({});
+  const readerPoller = useRef<VisibilityPoller | null>(null);
 
   const updateDoc = useCallback((update: (currentDoc: StoredDocument) => StoredDocument) => {
     const next = update(docRef.current);
@@ -57,24 +59,8 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
 
   useEffect(() => {
     alive.current = true;
-    let stopped = false;
-    let reading = false;
     const timers = saveTimers.current;
     const drafts = unsaved.current;
-    const poll = async () => {
-      if (reading || stopped || mutationLock.current) return;
-      reading = true;
-      const epoch = snapshotEpoch.current;
-      try {
-        const incoming = await api.get(docId);
-        if (!stopped && epoch === snapshotEpoch.current && !mutationLock.current) {
-          applySnapshot(incoming);
-          setPollError("");
-        }
-      } catch (e) {
-        if (!stopped) setPollError(`暂时无法更新进度，正在自动重连。${(e as Error).message}`);
-      } finally { reading = false; }
-    };
     const flushOnLeave = () => {
       for (const [idx, tagged] of Object.entries(drafts)) {
         clearTimeout(timers[Number(idx)]);
@@ -85,16 +71,40 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
         delete drafts[Number(idx)];
       }
     };
-    void poll();
-    const timer = setInterval(() => void poll(), 2_000);
     window.addEventListener("pagehide", flushOnLeave);
     return () => {
-      stopped = true;
       alive.current = false;
-      clearInterval(timer);
       window.removeEventListener("pagehide", flushOnLeave);
       flushOnLeave();
       // 不取消服务端任务；离开、刷新和关闭页面都不影响后台生成。
+    };
+  }, [docId]);
+
+  useEffect(() => {
+    let stopped = false;
+    const poller = createVisibilityPoller({
+      visibility: document,
+      shouldPollWhenHidden: () => playingRef.current && isBackgroundActive(documentProgress(docRef.current)),
+      getInterval: () => isBackgroundActive(documentProgress(docRef.current)) ? ACTIVE_POLL_MS : IDLE_POLL_MS,
+      poll: async (signal) => {
+        if (stopped || signal.aborted || mutationLock.current) return;
+        const epoch = snapshotEpoch.current;
+        try {
+          const incoming = await api.get(docId, signal);
+          if (!stopped && !signal.aborted && epoch === snapshotEpoch.current && !mutationLock.current) {
+            applySnapshot(incoming);
+            setPollError("");
+          }
+        } catch (e) {
+          if (!stopped && !signal.aborted) setPollError(`暂时无法更新进度，正在自动重连。${(e as Error).message}`);
+        }
+      },
+    });
+    readerPoller.current = poller;
+    return () => {
+      stopped = true;
+      poller.dispose();
+      if (readerPoller.current === poller) readerPoller.current = null;
     };
   }, [docId, applySnapshot]);
 
@@ -122,6 +132,7 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
         setSaving("saved");
         setSaveError("");
         onDocChanged();
+        if (!mutationLock.current) readerPoller.current?.refresh();
       }
     } catch (e) {
       if (alive.current) {
@@ -155,7 +166,7 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
     } finally {
       snapshotEpoch.current++;
       mutationLock.current = false;
-      if (alive.current) setBusy(false);
+      if (alive.current) { setBusy(false); readerPoller.current?.refresh(); }
     }
   }
 
@@ -179,7 +190,7 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
     } finally {
       snapshotEpoch.current++;
       mutationLock.current = false;
-      if (alive.current) setBusy(false);
+      if (alive.current) { setBusy(false); readerPoller.current?.refresh(); }
     }
   }
 
@@ -196,6 +207,7 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
   }
 
   const progress = documentProgress(doc);
+  const generationActive = isBackgroundActive(progress);
   const segs = doc.segments;
   const cur = segs[current];
   const curUrl = cur?.audioUrl;
@@ -205,6 +217,12 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
   const staleSegs = effectiveSegs.filter((segment) => segment.audioUrl && !segment.audioFresh && !segmentBusy(segment) && segment.generation?.status !== "failed");
   const failedSegs = effectiveSegs.filter((segment) => segment.generation?.status === "failed");
   const readyCount = segs.filter((segment) => segment.audioUrl).length;
+
+  useEffect(() => {
+    playingRef.current = playing;
+    // 隐藏时只为正在听读且仍在生成的文档保留读取；不重建调度器或播放器。
+    readerPoller.current?.reschedule();
+  }, [playing, generationActive]);
 
   useEffect(() => {
     const element = audioRef.current;
@@ -266,7 +284,7 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
     <section className="flex flex-col gap-3">
       <GenerationProgress progress={progress} busy={busy}
         onStart={() => void generationAction("start")} onRetry={() => void generationAction("retry")} onCancel={() => void generationAction("cancel")} />
-      <div ref={historyAnchor} className="scroll-mt-20"><GenerationHistory docId={docId} segmentIndices={segs.map((segment) => segment.idx)} filter={historyFilter} onFilterChange={setHistoryFilter} /></div>
+      <div ref={historyAnchor} className="scroll-mt-20"><GenerationHistory docId={docId} generationActive={generationActive} segmentIndices={segs.map((segment) => segment.idx)} filter={historyFilter} onFilterChange={setHistoryFilter} /></div>
       {pollError && <p role="status" className="text-xs text-zinc-500">{pollError}</p>}
       {actionError && <p role="alert" className="text-sm break-all text-red-600">{actionError}</p>}
       {saveError && <div role="alert" className="flex flex-wrap items-center gap-2 rounded-xl border border-red-200 p-3 text-sm text-red-700 dark:border-red-900 dark:text-red-300">
@@ -277,7 +295,7 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
       {!progress.scriptReady ? (
         <div className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
           <h2 className="mb-3 font-medium">原文</h2>
-          <div className="md min-w-0"><ReactMarkdown remarkPlugins={[remarkGfm]}>{doc.sourceText}</ReactMarkdown></div>
+          <div className="md min-w-0"><MarkdownContent>{doc.sourceText}</MarkdownContent></div>
         </div>
       ) : <>
         <div className="space-y-2 rounded-xl border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
@@ -312,7 +330,7 @@ export function Reader({ doc: initialDoc, onDocChanged }: { doc: StoredDocument;
         <div className="space-y-2">
           {segs.map((segment, i) => <div key={segment.idx} ref={(element) => { blockRefs.current[i] = element; }}
             className={`grid gap-3 rounded-xl border p-3 transition-colors ${showScript ? "md:grid-cols-[3fr_2fr]" : ""} ${current === i ? "border-amber-400 bg-amber-50 dark:border-amber-500/60 dark:bg-amber-500/10" : "border-transparent hover:border-zinc-200 dark:hover:border-zinc-800"}`}>
-            <div className="md min-w-0 cursor-pointer" onClick={() => jumpTo(i)} title="从这里开始播放"><ReactMarkdown remarkPlugins={[remarkGfm]}>{segment.markdown}</ReactMarkdown></div>
+            <div className="md min-w-0 cursor-pointer" onClick={() => jumpTo(i)} title="从这里开始播放"><MarkdownContent>{segment.markdown}</MarkdownContent></div>
             {showScript && <div className="flex flex-col gap-1 text-sm text-zinc-600 dark:text-zinc-400">
               <div className="flex items-center gap-2 text-xs">
                 <span className="rounded bg-zinc-200 px-1.5 dark:bg-zinc-800">{segment.kind}</span>

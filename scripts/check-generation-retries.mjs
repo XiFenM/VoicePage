@@ -70,7 +70,10 @@ function assertBackoff(historyEvents, expectedDelays) {
   });
 }
 
+let succeeded = false;
+let failure;
 try {
+  await ok("/api/settings/generation", "PATCH", { previewBeforeGeneration: false });
   await ok("/api/settings", "PATCH", { taskConcurrency: 1, textConcurrency: 1, ttsConcurrency: 1, segmentConcurrency: 1 });
   const network = await create("network", "MOCK_LLM_NETWORK_ONCE", false);
   const networkDue = await waiting(network);
@@ -172,6 +175,10 @@ try {
   assertBackoff(await history(restarted), [5000, 15000]);
   console.log("PASS: process restart preserves retry due time/budget and resumes without a browser request");
   console.log("All durable generation retry checks passed.");
+  succeeded = true;
+} catch (error) {
+  failure = error;
+  throw error;
 } finally {
-  await fixture.close();
+  await fixture.close({ success: succeeded, error: failure });
 }

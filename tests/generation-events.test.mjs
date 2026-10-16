@@ -239,12 +239,12 @@ test("pagination is ordered, exclusive and isolated per document", () => {
   assert.deepEqual(history.listGenerationEvents("other-document").events, []);
 });
 
-test("v5 backup preserves history and retry metadata but imports pending retries paused", () => {
+test("current backup preserves history and retry metadata but imports pending retries paused", () => {
   const doc = create();
   const scheduled = jobs.failJobWithRetry(claim(), { ...transient, retryAfterMs: 60_000 });
   const oldEvents = events(doc.id).map((event) => ({ ...event, id: 0 }));
   const zip = backup.exportBackup([doc.id]).zip;
-  assert.equal(JSON.parse(Buffer.from(unzipSync(zip)["manifest.json"]).toString()).version, 5);
+  assert.equal(JSON.parse(Buffer.from(unzipSync(zip)["manifest.json"]).toString()).version, 6);
   backup.importBackup(zip, "overwrite");
   assert.equal(row(doc.id).status, "cancelled");
   assert.equal(row(doc.id).attempt, 1);

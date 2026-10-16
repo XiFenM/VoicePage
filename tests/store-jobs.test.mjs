@@ -234,7 +234,7 @@ test("legacy backup overwrite may reset attempt, but a new claim owner fences th
   const oldSnapshot = store.getSegmentForTts(doc.id, 0);
   const entries = unzipSync(backup.exportBackup([doc.id]).zip);
   const manifest = JSON.parse(Buffer.from(entries["manifest.json"]).toString());
-  manifest.version = 4; // 旧备份没有持久 attempt；当前 v5 会保留它。
+  manifest.version = 4; // 旧备份没有持久 attempt；当前备份会保留它。
   entries["manifest.json"] = Buffer.from(JSON.stringify(manifest));
   backup.importBackup(zipSync(entries), "overwrite");
   assert.equal(jobs.isJobOwned(oldClaim), false);

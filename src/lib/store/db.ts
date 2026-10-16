@@ -12,7 +12,7 @@ import path from "node:path";
 export const DATA_DIR = path.resolve(/*turbopackIgnore: true*/ process.env.DATA_DIR ?? "data");
 export const AUDIO_DIR = path.join(/*turbopackIgnore: true*/ DATA_DIR, "audio");
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 declare global {
   var __readaloudDb: DatabaseSync | undefined;
@@ -164,6 +164,15 @@ function migrate(d: DatabaseSync) {
         model_id TEXT
       );
       CREATE INDEX idx_generation_events_document ON generation_events(doc_id, id DESC);
+    `);
+    if (version < 8) d.exec(`
+      ALTER TABLE documents ADD COLUMN prepared_blocks_json TEXT;
+      CREATE TABLE generation_settings (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        preview_before_generation INTEGER NOT NULL DEFAULT 1 CHECK(preview_before_generation IN (0, 1)),
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO generation_settings (id, preview_before_generation, updated_at) VALUES (1, 1, 0);
     `);
     d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}; COMMIT;`);
   } catch (error) {

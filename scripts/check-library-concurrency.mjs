@@ -1,6 +1,6 @@
 /** Isolated HTTP verification of library organization and live concurrency limits.
  * Run: node scripts/check-library-concurrency.mjs
- * Uses only a local mock and disposable SQLite/audio data; leaves fixture logs.
+ * Uses only a local mock and disposable SQLite/audio data; only failures retain logs.
  */
 import assert from "node:assert/strict";
 import { unzipSync, zipSync } from "fflate";
@@ -45,7 +45,10 @@ const settings = (body) => ok("/api/settings", "PATCH", body);
 const control = (id, action, extra = {}) => ok(`/api/documents/${id}/generation`, "POST", { action, ...extra });
 const collection = (kind, name, parentId = null) => ok("/api/collections", "POST", { kind, name, parentId });
 
+let succeeded = false;
+let failure;
 try {
+  await ok("/api/settings/generation", "PATCH", { previewBeforeGeneration: false });
   assert.deepEqual(await ok("/api/settings"), { taskConcurrency: 4, textConcurrency: 4, ttsConcurrency: 4, segmentConcurrency: 2 });
   const groupA = await collection("group", "分组甲");
   const groupB = await collection("group", "分组乙");
@@ -95,7 +98,7 @@ try {
   const exported = new Uint8Array(await (await raw("/api/backup")).arrayBuffer());
   const unpacked = unzipSync(exported);
   const manifest = JSON.parse(new TextDecoder().decode(unpacked["manifest.json"]));
-  assert.equal(manifest.version, 5);
+  assert.equal(manifest.version, 6);
   assert.ok(manifest.collections.some((item) => item.id === empty.id), "Full backup must include empty containers");
   const partial = unzipSync(new Uint8Array(await (await raw(`/api/backup?ids=${running.id}`)).arrayBuffer()));
   const partialManifest = JSON.parse(new TextDecoder().decode(partial["manifest.json"]));
@@ -118,7 +121,7 @@ try {
   assert.equal((await ok(`/api/documents/${running.id}`)).sessionId, null);
   await delay(300);
   assert.equal(mock.events.length, callsBeforeImport, "Importing completed records must not generate models again");
-  console.log("PASS: backup v5 preserves hierarchy/empty containers, skip/overwrite work, legacy imports stay unfiled");
+  console.log("PASS: backup v6 preserves hierarchy/empty containers, skip/overwrite work, legacy imports stay unfiled");
 
   for (const patch of [{ textConcurrency: 0 }, { textConcurrency: 33 }, { ttsConcurrency: 1.5 }, { taskConcurrency: -1 }, { segmentConcurrency: 17 }]) await invalid("/api/settings", "PATCH", patch);
   const configured = { taskConcurrency: 4, textConcurrency: 3, ttsConcurrency: 5, segmentConcurrency: 2 };
@@ -188,6 +191,10 @@ try {
   assert.ok(libraryAfterRestart.collections.some((item) => item.id === sessionA.id));
   console.log("PASS: hierarchy and concurrency settings survive a Next process restart");
   console.log("All library and concurrency integration checks passed.");
+  succeeded = true;
+} catch (error) {
+  failure = error;
+  throw error;
 } finally {
-  await fixture.close();
+  await fixture.close({ success: succeeded, error: failure });
 }

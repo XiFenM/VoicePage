@@ -83,7 +83,7 @@ function changeManifest(zip, change) {
 
 test("v4 migration leaves old records unarchived in their existing recency order", () => {
   const tree = library.getLibrary();
-  assert.equal(db().prepare("PRAGMA user_version").get().user_version, 7);
+  assert.equal(db().prepare("PRAGMA user_version").get().user_version, 8);
   assert.deepEqual(tree.collections, []);
   assert.deepEqual(documentsAt(null), ["old-b", "old-a"]);
   assert.deepEqual(tree.documents.map((doc) => doc.sessionId), [null, null]);
@@ -202,7 +202,7 @@ test("partial backup includes only ancestor containers; full backup preserves em
   const a = document(s.id), b = document(s.id);
   library.moveLibraryItem({ kind: "document", id: b.id, parentId: s.id, beforeId: a.id });
   const partial = unpack(backup.exportBackup([a.id]).zip);
-  assert.equal(partial.version, 5);
+  assert.equal(partial.version, 6);
   assert.deepEqual(new Set(partial.collections.map((item) => item.id)), new Set([g.id, s.id]));
   assert.equal(partial.documents[0].sessionId, s.id);
   const zip = backup.exportBackup().zip;

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import type { GenerationSettings } from "@/lib/generation-settings";
 import { LibraryTree, type LibraryTreeProps } from "./LibraryTree";
 import { SettingsDialog } from "./SettingsDialog";
 
@@ -9,6 +10,7 @@ type HistorySidebarProps = LibraryTreeProps & {
   historyLoading: boolean;
   historyError: string;
   onRetryHistory: () => void;
+  onGenerationSettingsChanged: (settings: GenerationSettings) => void;
 };
 
 export function HistorySidebar(props: HistorySidebarProps) {
@@ -42,7 +44,8 @@ export function HistorySidebar(props: HistorySidebarProps) {
           设置
         </button>
       </div>
-      {settingsOpen && <SettingsDialog hasData={Boolean(props.library.documents.length || props.library.collections.length)} onChanged={props.onChanged} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsDialog hasData={Boolean(props.library.documents.length || props.library.collections.length)} onChanged={props.onChanged}
+        onGenerationSettingsChanged={props.onGenerationSettingsChanged} onClose={() => setSettingsOpen(false)} />}
     </aside>
   );
 }

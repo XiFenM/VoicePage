@@ -10,11 +10,20 @@ import { getRuntimeSettings } from "./runtime-settings";
 import { activeModelCounts, expireModelPermits } from "./model-permits";
 import { appendGenerationEvent, JobErrorSchema, recordJobSuccess } from "./generation-events";
 import { MAX_AUTO_RETRIES, retryDelayMs } from "@/lib/generation/retry-policy";
+import { parsePreparedBlocks } from "@/lib/script/source-blocks";
+
+export { parsePreparedBlocks } from "@/lib/script/source-blocks";
 
 export { getBackgroundProgress, isJobOwned } from "./job-state";
 export type { JobClaim, JobPhase } from "./types";
 
 type Row = Record<string, string | number | null>;
+
+export function getPreparedBlocks(docId: string): SourceBlock[] | null {
+  const row = db().prepare("SELECT prepared_blocks_json FROM documents WHERE id = ?").get(docId) as Row | undefined;
+  if (!row?.prepared_blocks_json) return null;
+  return parsePreparedBlocks(JSON.parse(row.prepared_blocks_json as string));
+}
 
 function queueJob(id: string, idx: number, force: boolean, now: number): boolean {
   const row = db().prepare("SELECT status FROM jobs WHERE doc_id = ? AND idx = ?").get(id, idx) as Row | undefined;
@@ -29,16 +38,17 @@ function queueJob(id: string, idx: number, force: boolean, now: number): boolean
 }
 
 /** 先可靠保存原文与任务，再让服务端 worker 独立于请求处理生成。 */
-export function createQueuedDocument(input: { sourceText: string; settings: DocSettings; scriptModel: string; sessionId?: string | null }): StoredDocument {
+export function createQueuedDocument(input: { sourceText: string; settings: DocSettings; scriptModel: string; sessionId?: string | null; preparedBlocks?: SourceBlock[] }): StoredDocument {
   const id = newId();
   const now = Date.now();
   const s = input.settings;
+  const preparedBlocks = input.preparedBlocks === undefined ? null : parsePreparedBlocks(input.preparedBlocks);
   tx(() => {
     const sessionId = input.sessionId ?? null;
     assertSession(sessionId);
-    db().prepare(`INSERT INTO documents (id, title, source_text, persona_id, tts_model_id, voice, use_tags, use_style, script_model, created_at, updated_at, script_ready, session_id, position)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
-      .run(id, makeTitle(input.sourceText), input.sourceText, s.personaId, s.ttsModelId, s.voice, +s.useTags, +s.useStyle, input.scriptModel, now, now, sessionId, nextDocumentPosition(sessionId));
+    db().prepare(`INSERT INTO documents (id, title, source_text, persona_id, tts_model_id, voice, use_tags, use_style, script_model, created_at, updated_at, script_ready, session_id, position, prepared_blocks_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
+      .run(id, makeTitle(input.sourceText), input.sourceText, s.personaId, s.ttsModelId, s.voice, +s.useTags, +s.useStyle, input.scriptModel, now, now, sessionId, nextDocumentPosition(sessionId), preparedBlocks === null ? null : JSON.stringify(preparedBlocks));
     queueJob(id, -1, false, now);
   });
   return getDocument(id)!;
@@ -50,6 +60,8 @@ export function completeScript(claim: JobClaim, blocks: SourceBlock[], segments:
     if (claim.idx !== -1 || claim.kind !== "script" || !isJobOwned(claim)) return false;
     const document = getDocument(claim.docId);
     if (!document || document.generation.scriptReady) return false;
+    const prepared = getPreparedBlocks(claim.docId);
+    if (prepared && JSON.stringify(prepared) !== JSON.stringify(parsePreparedBlocks(blocks))) return false;
     const pending = needsAutomaticTags(document);
     const now = Date.now();
     const insert = db().prepare(`INSERT INTO segments (doc_id, idx, kind, lang, markdown, speech, tagged, tag_status, tag_model_id, updated_at)

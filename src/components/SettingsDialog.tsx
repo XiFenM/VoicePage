@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useId, useRef, useState } from "react";
+import type { GenerationSettings } from "@/lib/generation-settings";
 import { RuntimeSettingsPanel } from "./RuntimeSettingsPanel";
+import { GenerationSettingsPanel } from "./GenerationSettingsPanel";
 import { BackupSettings } from "./BackupSettings";
 
 const SECTIONS = [
@@ -10,15 +12,19 @@ const SECTIONS = [
 ] as const;
 
 /** 统一设置界面。阅读器保持挂载，分类切换也保留尚未保存的设置输入。 */
-export function SettingsDialog({ hasData, onChanged, onClose }: {
+export function SettingsDialog({ hasData, onChanged, onGenerationSettingsChanged, onClose }: {
   hasData: boolean;
   onChanged: () => void;
+  onGenerationSettingsChanged: (settings: GenerationSettings) => void;
   onClose: () => void;
 }) {
   const id = useId();
   const dialog = useRef<HTMLDialogElement>(null);
   const [section, setSection] = useState<(typeof SECTIONS)[number]["id"]>("generation");
-  const [busy, setBusy] = useState(false);
+  const [generationBusy, setGenerationBusy] = useState(false);
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const busy = generationBusy || runtimeBusy || backupBusy;
 
   useEffect(() => {
     const element = dialog.current;
@@ -53,8 +59,11 @@ export function SettingsDialog({ hasData, onChanged, onClose }: {
             </button>)}
           </nav>
           <div className="min-h-0 min-w-0 flex-1 overflow-y-auto p-5 pb-[max(1.25rem,env(safe-area-inset-bottom))] sm:p-7">
-            <div id={`${id}-generation`} hidden={section !== "generation"}><RuntimeSettingsPanel onBusyChange={setBusy} /></div>
-            <div id={`${id}-data`} hidden={section !== "data"}><BackupSettings hasData={hasData} onChanged={onChanged} onBusyChange={setBusy} /></div>
+            <div id={`${id}-generation`} hidden={section !== "generation"} className="space-y-6">
+              <fieldset disabled={runtimeBusy || backupBusy} className="min-w-0"><GenerationSettingsPanel onBusyChange={setGenerationBusy} onSaved={onGenerationSettingsChanged} /></fieldset>
+              <fieldset disabled={generationBusy || backupBusy} className="min-w-0"><RuntimeSettingsPanel onBusyChange={setRuntimeBusy} /></fieldset>
+            </div>
+            <div id={`${id}-data`} hidden={section !== "data"}><BackupSettings hasData={hasData} onChanged={onChanged} onBusyChange={setBackupBusy} /></div>
           </div>
         </div>
       </div>

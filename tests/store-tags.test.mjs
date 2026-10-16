@@ -65,7 +65,7 @@ function create(overrides = {}) {
 
 test("v1 cached database migrates atomically to ready tags without invalidating existing audio", () => {
   const doc = store.getDocument("legacy");
-  assert.equal(db().prepare("PRAGMA user_version").get().user_version, 7);
+  assert.equal(db().prepare("PRAGMA user_version").get().user_version, 8);
   assert.equal(db().prepare("SELECT COUNT(*) AS n FROM generation_events").get().n, 0);
   assert.equal(doc.segments[0].tagStatus, "ready");
   assert.equal(doc.segments[0].tagModelId, settings.ttsModelId);
@@ -144,7 +144,7 @@ test("current backup preserves pending/manual state and v1 import remains ready 
   const { zip } = backup.exportBackup([pending.id, manual.id]);
   const entries = unzipSync(zip);
   const manifest = JSON.parse(Buffer.from(entries["manifest.json"]).toString());
-  assert.equal(manifest.version, 5);
+  assert.equal(manifest.version, 6);
   store.deleteDocument(pending.id);
   store.deleteDocument(manual.id);
   assert.equal(backup.importBackup(zip).imported, 2);

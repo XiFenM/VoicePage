@@ -2,98 +2,136 @@
  * Real HTTP + process-lifecycle checks against an isolated Next dev instance.
  * Run: node scripts/check-background-generation.mjs
  *
- * Copies source/config only (never .env files), injects a local fake model and
+ * Copies source/config and isolated dependencies (never .env files), injects a local fake model and
  * test credentials, and uses a fresh SQLite/audio directory. No paid API calls.
  * Abruptly restarts its own Next process and waits for lease recovery, using a
  * 6s lease for this fixture (set TEST_LEASE_MS=60000 to test the 60s default).
- * All test servers stop on exit; the isolated directory remains for inspection.
+ * Success removes the temporary workspace; failures retain bounded diagnostic logs only.
  */
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import net from "node:net";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createMockZenmux } from "./mock-zenmux.mjs";
+import { createQaWorkspace, prepareQaSource, stopQaProcess, closeQaServer } from "./qa-workspace.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const fixture = fs.mkdtempSync(path.join(os.homedir(), "voicepage-background-qa-"));
-const dataDir = path.join(fixture, "data");
-for (const name of ["src", "public", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "tsconfig.json"]) {
-  if (fs.existsSync(path.join(root, name))) fs.cpSync(path.join(root, name), path.join(fixture, name), { recursive: true });
-}
-let commonRoot = root;
-while (!fixture.startsWith(`${commonRoot}${path.sep}`)) {
-  const parent = path.dirname(commonRoot);
-  if (parent === commonRoot) break;
-  commonRoot = parent;
-}
-fs.writeFileSync(path.join(fixture, "next.config.ts"), fs.readFileSync(path.join(root, "next.config.ts"), "utf8").replace("turbopack: {", `turbopack: {\n    root: ${JSON.stringify(commonRoot)},`));
-fs.symlinkSync(path.join(root, "node_modules"), path.join(fixture, "node_modules"), "dir");
-assert.ok(!fs.readdirSync(fixture).some((name) => name.startsWith(".env")));
-
-const mock = createMockZenmux({ spokenMs: 700, tagsMs: 500, speechMs: 500, slowSpokenMs: 5000, slowTagsMs: 12000 });
-await new Promise((resolve) => mock.server.listen(0, "127.0.0.1", resolve));
-const mockUrl = `http://127.0.0.1:${mock.server.address().port}/api/v1`;
-const reserve = net.createServer();
-await new Promise((resolve) => reserve.listen(0, "127.0.0.1", resolve));
-const appPort = reserve.address().port;
-await new Promise((resolve) => reserve.close(resolve));
-const app = `http://127.0.0.1:${appPort}`;
-const appEnv = {
-  ...process.env,
-  ZENMUX_BASE_URL: mockUrl,
-  ZENMUX_API_KEY: "voicepage-local-mock",
-  SCRIPT_MODEL: "local/mock",
-  APP_PASSWORD: "voicepage-test",
-  SESSION_SECRET: "voicepage-test-session-secret",
-  DATA_DIR: dataDir,
-  BACKGROUND_LEASE_MS: process.env.TEST_LEASE_MS ?? "6000",
-};
-assert.equal(appEnv.SCRIPT_MODEL, "local/mock");
-const token = `MOCK_CASE_bg${Date.now()}`;
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let workspace;
+let fixture;
+let dataDir;
+let mock;
+let reserve;
+let appPort;
+let app;
+let mockUrl;
+let appEnv;
+let nextRuntime;
 let child;
+let database;
 let logs = "";
 let cookie = "";
+let success = false;
+let failure;
+let cleanupPromise;
+let interrupted = false;
+const runAbort = new AbortController();
+const token = `MOCK_CASE_bg${Date.now()}`;
+const delay = (ms) => sleep(ms, undefined, { signal: runAbort.signal });
+
+function cleanup() {
+  if (cleanupPromise) return cleanupPromise;
+  cleanupPromise = (async () => {
+    runAbort.abort(new Error("QA cleanup"));
+    const errors = [];
+    for (const release of [
+      () => stopQaProcess(child),
+      () => { database?.close(); database = undefined; },
+      () => closeQaServer(reserve),
+      () => closeQaServer(mock?.server),
+    ]) {
+      try { await release(); } catch (error) { errors.push(error); }
+    }
+    const primaryFailure = failure;
+    if (errors.length) failure = new AggregateError(primaryFailure ? [primaryFailure, ...errors] : errors, "QA resource cleanup failed");
+    try {
+      workspace?.finish({ success: success && !failure, error: primaryFailure ?? failure, logs: {
+        "next-test.log": logs, "mock-events.json": mock?.events ?? [],
+        ...(errors.length ? { "cleanup-errors.log": errors.map((error) => error instanceof Error ? error.stack : String(error)).join("\n") } : {}),
+      } });
+    } catch (error) {
+      failure = new AggregateError(failure ? [failure, error] : [error], "QA workspace cleanup failed");
+    } finally {
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
+    }
+  })();
+  return cleanupPromise;
+}
+
+function interrupt(signal) {
+  if (interrupted) return;
+  interrupted = true;
+  failure ??= new Error(`QA interrupted by ${signal}`);
+  runAbort.abort(failure);
+  const code = signal === "SIGINT" ? 130 : 143;
+  process.exitCode = code;
+  void cleanup().finally(() => process.exit(code));
+}
+const onSigint = () => interrupt("SIGINT");
+const onSigterm = () => interrupt("SIGTERM");
+process.on("SIGINT", onSigint);
+process.on("SIGTERM", onSigterm);
+
+async function listen(server) {
+  runAbort.signal.throwIfAborted();
+  const ready = once(server, "listening", { signal: runAbort.signal });
+  server.listen(0, "127.0.0.1");
+  await ready;
+  runAbort.signal.throwIfAborted();
+}
 
 async function startNext() {
-  child = spawn(process.execPath, [path.join(root, "node_modules/next/dist/bin/next"), "dev", "--hostname", "127.0.0.1", "--port", String(appPort)], {
-    cwd: fixture,
-    env: appEnv,
-    detached: process.platform !== "win32",
-    stdio: ["ignore", "pipe", "pipe"],
+  runAbort.signal.throwIfAborted();
+  child = spawn(process.execPath, [nextRuntime.bin, "dev", "--hostname", "127.0.0.1", "--port", String(appPort)], {
+    cwd: fixture, env: appEnv, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
   });
   const processRef = child;
+  const recordOutput = (bytes) => { logs = `${logs}${bytes}`.slice(-50000); };
+  processRef.stdout.on("data", recordOutput);
+  processRef.stderr.on("data", recordOutput);
   await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Isolated Next server did not become ready")), 60000);
-    const onOutput = (bytes) => {
-      const text = bytes.toString();
-      logs = `${logs}${text}`.slice(-30000);
-      if (text.includes("Ready in")) {
-        clearTimeout(timeout);
-        resolve();
-      }
-    };
-    processRef.stdout.on("data", onOutput);
-    processRef.stderr.on("data", onOutput);
-    processRef.once("exit", (code) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
-      reject(new Error(`Isolated Next exited before ready (${code})`));
-    });
-    processRef.once("error", reject);
+      processRef.stdout.removeListener("data", ready);
+      processRef.stderr.removeListener("data", ready);
+      processRef.removeListener("exit", exited);
+      processRef.removeListener("error", failed);
+      runAbort.signal.removeEventListener("abort", aborted);
+      if (error) reject(error); else resolve();
+    };
+    const ready = (bytes) => { if (String(bytes).includes("Ready in")) finish(); };
+    const exited = (code) => finish(new Error(`Isolated Next exited before ready (${code})`));
+    const failed = (error) => finish(error);
+    const aborted = () => finish(runAbort.signal.reason);
+    const timeout = setTimeout(() => finish(new Error("Isolated Next server did not become ready")), 60000);
+    processRef.stdout.on("data", ready);
+    processRef.stderr.on("data", ready);
+    processRef.once("exit", exited);
+    processRef.once("error", failed);
+    runAbort.signal.addEventListener("abort", aborted, { once: true });
+    if (runAbort.signal.aborted) aborted();
   });
 }
 
 async function stopNext(signal = "SIGTERM") {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
-  const stopped = once(child, "exit");
-  if (process.platform === "win32") child.kill(signal);
-  else process.kill(-child.pid, signal);
-  await stopped;
+  await stopQaProcess(child, signal);
 }
 
 async function request(endpoint, method = "GET", body) {
@@ -101,7 +139,7 @@ async function request(endpoint, method = "GET", body) {
     method,
     headers: { "Content-Type": "application/json", Cookie: cookie, Connection: "close" },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.any([runAbort.signal, AbortSignal.timeout(30000)]),
   });
   return { status: response.status, body: await response.json() };
 }
@@ -124,11 +162,13 @@ function matching(part, stage, status) {
 }
 
 function waitMock(predicate, message, timeoutMs = 30000) {
+  runAbort.signal.throwIfAborted();
   if (predicate()) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timer);
       mock.changes.removeListener("change", check);
+      runAbort.signal.removeEventListener("abort", aborted);
     };
     const check = () => {
       if (predicate()) {
@@ -140,6 +180,8 @@ function waitMock(predicate, message, timeoutMs = 30000) {
       cleanup();
       reject(new Error(message));
     }, timeoutMs);
+    const aborted = () => { cleanup(); reject(runAbort.signal.reason); };
+    runAbort.signal.addEventListener("abort", aborted, { once: true });
     mock.changes.on("change", check);
     check();
   });
@@ -164,11 +206,36 @@ async function completed(part, doc, count = 1) {
 }
 
 try {
+  workspace = createQaWorkspace("background-generation");
+  fixture = workspace.dir;
+  dataDir = path.join(fixture, "data");
+  nextRuntime = prepareQaSource(root, fixture);
+  mock = createMockZenmux({ spokenMs: 700, tagsMs: 500, speechMs: 500, slowSpokenMs: 5000, slowTagsMs: 12000 });
+  await listen(mock.server);
+  mockUrl = `http://127.0.0.1:${mock.server.address().port}/api/v1`;
+  reserve = net.createServer();
+  await listen(reserve);
+  appPort = reserve.address().port;
+  await closeQaServer(reserve);
+  reserve = undefined;
+  app = `http://127.0.0.1:${appPort}`;
+  appEnv = {
+    ...process.env, ZENMUX_BASE_URL: mockUrl, ZENMUX_API_KEY: "voicepage-local-mock", SCRIPT_MODEL: "local/mock",
+    APP_PASSWORD: "voicepage-test", SESSION_SECRET: "voicepage-test-session-secret", DATA_DIR: dataDir,
+    BACKGROUND_LEASE_MS: process.env.TEST_LEASE_MS ?? "6000", NODE_PATH: nextRuntime.nodePath,
+  };
+  delete appEnv.BACKGROUND_WORKER_DISABLED;
+  delete appEnv.NEXT_PHASE;
+  delete appEnv.NODE_ENV;
+  assert.equal(appEnv.SCRIPT_MODEL, "local/mock");
   await startNext();
   console.log(JSON.stringify({ fixture, app, mockUrl, model: appEnv.SCRIPT_MODEL, leaseMs: Number(appEnv.BACKGROUND_LEASE_MS) }));
-  const login = await fetch(`${app}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "voicepage-test" }) });
+  const login = await fetch(`${app}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: "voicepage-test" }), signal: AbortSignal.any([runAbort.signal, AbortSignal.timeout(30000)]) });
   assert.equal(login.status, 200);
   cookie = login.headers.get("set-cookie").split(";")[0];
+  const generationSettings = await request("/api/settings/generation", "PATCH", { previewBeforeGeneration: false });
+  assert.equal(generationSettings.status, 200);
+  assert.equal(generationSettings.body.previewBeforeGeneration, false);
   const limits = { taskConcurrency: 2, textConcurrency: 2, ttsConcurrency: 2, segmentConcurrency: 2 };
   const configured = await request("/api/settings", "PATCH", limits);
   assert.equal(configured.status, 200);
@@ -231,9 +298,10 @@ try {
   assert.equal(matching("queued", "spoken").length, 0, "Third document should remain queued behind global limit");
   await stopNext("SIGKILL");
   await delay(200);
-  const db = new DatabaseSync(path.join(dataDir, "readaloud.db"), { readOnly: true });
-  const jobs = db.prepare("SELECT doc_id, status, attempt, lease_until FROM jobs WHERE doc_id IN (?, ?, ?)").all(leaseA.id, leaseB.id, queued.id);
-  db.close();
+  database = new DatabaseSync(path.join(dataDir, "readaloud.db"), { readOnly: true });
+  const jobs = database.prepare("SELECT doc_id, status, attempt, lease_until FROM jobs WHERE doc_id IN (?, ?, ?)").all(leaseA.id, leaseB.id, queued.id);
+  database.close();
+  database = undefined;
   assert.equal(jobs.filter((job) => job.status === "running").length, 2);
   assert.equal(jobs.filter((job) => job.status === "queued").length, 1);
   const leaseUntil = Math.max(...jobs.map((job) => job.lease_until ?? 0));
@@ -249,15 +317,11 @@ try {
   assert.equal(matching("queued", "spoken").length, 1);
   assert.ok(mock.stats().maxTextRequests <= 2 && mock.stats().maxTtsRequests <= 2 && mock.stats().maxActiveRequests <= 4, JSON.stringify(mock.stats()));
   console.log(JSON.stringify({ check: "restart recovers queued and expired leases without any browser request", ...mock.stats() }));
+  success = true;
   console.log("All background generation lifecycle checks passed.");
 } catch (error) {
-  console.error(logs);
-  throw error;
+  failure ??= error;
 } finally {
-  await stopNext();
-  mock.server.closeAllConnections();
-  await new Promise((resolve) => mock.server.close(resolve));
-  fs.writeFileSync(path.join(fixture, "next-test.log"), logs);
-  fs.writeFileSync(path.join(fixture, "mock-events.json"), JSON.stringify(mock.events, null, 2));
-  console.log(`Kept isolated fixture: ${fixture}`);
+  await cleanup();
 }
+if (failure && !interrupted) throw failure;

@@ -2,7 +2,7 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 import { getDocument, getSegmentForTags, getSegmentForTts, saveSegmentTags, saveSegmentAudio, audioHash } from "@/lib/store/documents";
 import {
-  claimNextJob, renewJobLease, isJobOwned, setJobPhase, completeJob, failJobWithRetry, completeScript,
+  claimNextJob, renewJobLease, isJobOwned, setJobPhase, completeJob, failJobWithRetry, completeScript, getPreparedBlocks,
 } from "@/lib/store/jobs";
 import type { JobClaim } from "@/lib/store/types";
 import { addTags, runScriptPipeline } from "@/lib/script/pipeline";
@@ -14,7 +14,7 @@ import { MODEL_REQUEST_TIMEOUT_MS } from "./timeouts";
 
 // 进度和队列保存在 SQLite。此循环只负责执行，可以随 Node 服务重启。
 // 与任何浏览器请求无关；构建/静态预渲染时绝不启动，也不支持无常驻进程的托管环境。
-const WORKER_VERSION = 5;
+const WORKER_VERSION = 6;
 
 function leaseDuration(): number {
   const configured = Number(process.env.BACKGROUND_LEASE_MS ?? 60_000);
@@ -107,8 +107,9 @@ export async function executeBackgroundJob(claim: JobClaim, signal: AbortSignal)
   if (!doc) throw new LeaseLostError("记录已删除");
 
   if (claim.kind === "script") {
+    const preparedBlocks = getPreparedBlocks(claim.docId) ?? undefined;
     const script = await withModelSlot("text", "spoken", claim, signal, (modelSignal) => runScriptPipeline({
-      text: doc.sourceText, personaId: doc.personaId, scriptModel: doc.scriptModel, signal: modelSignal,
+      text: doc.sourceText, personaId: doc.personaId, scriptModel: doc.scriptModel, signal: modelSignal, preparedBlocks,
     }));
     assertOwned(claim, signal);
     if (!script.blocks.length) throw new Error("原文没有可处理的内容");

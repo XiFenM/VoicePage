@@ -9,6 +9,8 @@ import type { GenerationEvent, JobErrorDetail, JobPhase, LibraryCollection, Retr
 import { nextDocumentPosition } from "./organization";
 import { appendGenerationEvent, exportGenerationEvents, GenerationEventSchema, JobErrorSchema, parseJobError } from "./generation-events";
 import { MAX_AUTO_RETRIES } from "@/lib/generation/retry-policy";
+import type { SourceBlock } from "@/lib/script/segment";
+import { parsePreparedBlocks } from "./jobs";
 
 // 备份格式（.zip）：
 //   manifest.json                 { format, version, exportedAt, documents: [...] }
@@ -16,7 +18,7 @@ import { MAX_AUTO_RETRIES } from "@/lib/generation/retry-policy";
 // 设计为与数据库结构解耦：导入时按 manifest 逐条写入，方便以后升级表结构。
 
 export const BACKUP_FORMAT = "readaloud-backup";
-export const BACKUP_VERSION = 5;
+export const BACKUP_VERSION = 6;
 
 interface BackupSegment {
   idx: number;
@@ -50,6 +52,7 @@ interface BackupDocument {
   createdAt: number;
   updatedAt: number;
   scriptReady?: boolean;
+  preparedBlocks?: SourceBlock[];
   jobs?: BackupJob[];
   events?: GenerationEvent[];
   segments: BackupSegment[];
@@ -111,6 +114,7 @@ export function exportBackup(ids?: string[]): { zip: Uint8Array; count: number }
       createdAt: Number(d.created_at),
       updatedAt: Number(d.updated_at),
       scriptReady: !!d.script_ready,
+      preparedBlocks: d.prepared_blocks_json ? parsePreparedBlocks(JSON.parse(d.prepared_blocks_json as string)) : undefined,
       events: exportGenerationEvents(d.id as string),
       jobs: (db().prepare("SELECT * FROM jobs WHERE doc_id = ? ORDER BY idx").all(d.id) as Row[]).map((job) => ({
         idx: Number(job.idx), kind: job.kind as BackupJob["kind"], status: job.status as BackupJob["status"],
@@ -255,6 +259,11 @@ export function importBackup(zipBytes: Uint8Array, mode: ImportMode = "skip"): I
           result.skipped++;
           continue;
         }
+        let preparedBlocks: SourceBlock[] | null = null;
+        if (manifest.version >= 6 && doc.preparedBlocks !== undefined) {
+          try { preparedBlocks = parsePreparedBlocks(doc.preparedBlocks); }
+          catch { throw new BackupError("备份中的预览分块无效"); }
+        }
         const docAudioDir = path.join(/*turbopackIgnore: true*/ AUDIO_DIR, doc.id);
         const stagingDir = `${docAudioDir}.importing-${crypto.randomUUID()}`;
         stagingDirs.push(stagingDir);
@@ -275,10 +284,10 @@ export function importBackup(zipBytes: Uint8Array, mode: ImportMode = "skip"): I
         db().prepare("DELETE FROM documents WHERE id = ?").run(doc.id);
         db()
           .prepare(
-            `INSERT INTO documents (id, title, source_text, persona_id, tts_model_id, voice, use_tags, use_style, script_model, created_at, updated_at, script_ready, session_id, position)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO documents (id, title, source_text, persona_id, tts_model_id, voice, use_tags, use_style, script_model, created_at, updated_at, script_ready, session_id, position, prepared_blocks_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(doc.id, doc.title, doc.sourceText, doc.personaId, doc.ttsModelId, doc.voice, +doc.useTags, +doc.useStyle, doc.scriptModel, doc.createdAt, doc.updatedAt, manifest.version < 3 || doc.scriptReady !== false ? 1 : 0, sessionId, position);
+          .run(doc.id, doc.title, doc.sourceText, doc.personaId, doc.ttsModelId, doc.voice, +doc.useTags, +doc.useStyle, doc.scriptModel, doc.createdAt, doc.updatedAt, manifest.version < 3 || doc.scriptReady !== false ? 1 : 0, sessionId, position, preparedBlocks === null ? null : JSON.stringify(preparedBlocks));
         const ins = db().prepare(
           `INSERT INTO segments (doc_id, idx, kind, lang, markdown, speech, tagged, tag_status, tag_model_id, audio_file, audio_hash, audio_version, audio_bytes, audio_model_id, audio_voice, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
